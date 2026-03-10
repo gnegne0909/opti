@@ -5,7 +5,7 @@ Vérification HMAC-SHA256 + cache local signé + ID machine
 import hmac, hashlib, base64, json, time, uuid, re, os, platform
 
 # ── Clé secrète maître ── CHANGER AVANT DÉPLOIEMENT ──────────────────────────
-MASTER_SECRET     = b"WinOptPro_S3cr3t_K3y_2025_!#@$_CHANGE_ME"
+MASTER_SECRET     = b"WinOpt_k7#Xm2@pQ9_zR4wN8_2025!"
 LICENSE_SERVER    = "http://localhost:5000"          # ton domaine ici
 LICENSE_CACHE_FILE = os.path.join(os.path.expanduser("~"), ".winopt_lic")
 
