@@ -170,7 +170,7 @@ def init_db():
         frames_sent INTEGER DEFAULT 0
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS addon_licenses (
-        key TEXT PRIMARY KEY, addon_key TEXT, plan TEXT DEFAULT 'NORMAL',
+        key TEXT PRIMARY KEY, addon_key TEXT,  TEXT DEFAULT 'NORMAL',
         status TEXT DEFAULT 'active', created_at INTEGER, note TEXT
     )""")
     # Table liaison addons <-> users (FIX ADDONS)
@@ -193,9 +193,9 @@ def init_db():
     try: c.execute("ALTER TABLE tickets ADD COLUMN priority TEXT DEFAULT 'normal'")
     except: pass
     # Migration: LIFETIME supprimé → tout devient PRO
-    try: c.execute("UPDATE users SET plan='PRO' WHERE plan='LIFETIME'")
+    try: c.execute("UPDATE users SET ='PRO' WHERE ='LIFETIME'")
     except: pass
-    try: c.execute("UPDATE licenses SET plan='PRO' WHERE plan='LIFETIME'")
+    try: c.execute("UPDATE licenses SET ='PRO' WHERE ='LIFETIME'")
     except: pass
     conn.commit()
     if not conn.execute("SELECT 1 FROM admins WHERE username=?", (DEFAULT_ADMIN["username"],)).fetchone():
@@ -246,7 +246,7 @@ def get_setting(key, default="0"):
 def set_setting(key, value):
     conn = get_db(); conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value)); conn.commit(); conn.close()
 
-def generate_key(plan="NORMAL"):
+def generate_key(="NORMAL"):
     chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     lid = "".join(random.choices(chars, k=12))
     sig = hmac.new(MASTER_SECRET, lid.encode(), hashlib.sha256).hexdigest()[:8].upper()
@@ -405,7 +405,7 @@ def api_register():
     if conn.execute("SELECT 1 FROM users WHERE license_key=?", (license_key,)).fetchone():
         conn.close(); return jsonify({"success": False, "reason": "Clé déjà utilisée"})
 
-    plan = lic["plan"]
+     = lic["plan"]
     conn.execute("""INSERT INTO users
         (username,password_hash,license_key,plan,discord_id,ip,os_info,cpu_info,gpu_info,ram_info,motherboard_info,disk_info,status,created_at,first_login_done)
         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -4123,7 +4123,7 @@ def api_shop_order():
     conn.close()
 
     # Email en arrière-plan
-     result = _send_email(
+    result = _send_email(
         email,
         f"✅ WinOptimizer Pro — Commande #{order_id} confirmée",
         _welcome_email(email, username, password, plan, license_key, order_id)
@@ -4444,3 +4444,4 @@ if __name__ == "__main__":
     print(f"  DB       : {DB_PATH}")
     print("="*54)
     app.run(host="0.0.0.0", port=port, debug=False)
+
