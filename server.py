@@ -1,0 +1,6974 @@
+"""
+server.py — WinOptimizer Pro v4.0
+Panel admin : /admin  |  API : /api/...
+
+NOUVEAU v4.0 :
+  - 🖥️ Remote Control : viewer live WebSocket depuis le panel admin
+  - 👥 Panel Staff++ : analytics live, alert center, notes système, actions rapides
+  - 👤 Panel User++ : profil enrichi, historique logins, sessions actives, hardware map
+  - 📊 Dashboard v2 : graphiques temps réel, top IPs, activité par pays
+  - 🔔 Système de notifications admin en temps réel
+  - 🗂️ Gestion notes & tags utilisateurs
+  - 🔍 Recherche avancée full-text
+"""
+
+from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for, Response, abort
+import hmac, hashlib, json, time, os, sqlite3, secrets, string, random
+import re, urllib.request, threading, struct, zlib, base64, io, smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from functools import wraps
+from datetime import datetime
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+# ─── CONFIG ────────────────────────────────────────────────────────────────────
+MASTER_SECRET   = os.environ.get("MASTER_SECRET", "WinOpt_k7#Xm2@pQ9_zR4wN8_2025!").encode()
+DB_PATH         = "licenses.db"
+DISCORD_BOT_URL = "http://localhost:8080"
+DEFAULT_ADMIN   = {"username": "xywez", "password": "Admin2025!", "role": "owner"}
+APP_VERSION     = "4.0"
+
+SITE_URL        = os.environ.get("SITE_URL", "https://opti-p8wu.onrender.com")
+DISCORD_INVITE  = "https://discord.gg/8fvBAJXHU3"
+XYWEZ_IP        = "88.190.145.142"   # IP whitelistée silencieuse
+
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "BOT_INTERNAL_TOKEN")
+
+SMTP_HOST    = os.environ.get("SMTP_HOST", "")
+SMTP_PORT    = int(os.environ.get("SMTP_PORT", ""))
+SMTP_USER    = os.environ.get("SMTP_USER", "")
+SMTP_PASS    = os.environ.get("SMTP_PASS", "")
+SMTP_FROM    = os.environ.get("SMTP_FROM", "")
+
+SHOP_PRICES = {
+    "NORMAL": {"price": 4.99,  "label": "NORMAL"},
+    "PRO":    {"price": 9.99,  "label": "PRO"},
+}
+
+# Remote control sessions {session_id: {username, socket, active, frames_sent}}
+_remote_sessions = {}
+_remote_lock = threading.Lock()
+
+# SSE clients pour notifications live {admin: queue}
+_sse_clients = []
+_sse_lock = threading.Lock()
+
+# ─── IP HELPER ────────────────────────────────────────────────────────────────
+_IPV4_RE = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
+
+def _is_ipv4(ip: str) -> bool:
+    return bool(_IPV4_RE.match(ip or ""))
+
+def get_real_ip() -> str:
+    candidates = [
+        request.headers.get("CF-Connecting-IP", ""),
+        request.headers.get("X-Real-IP", ""),
+        (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()),
+        request.remote_addr or "",
+    ]
+    for ip in candidates:
+        ip = ip.strip()
+        if _is_ipv4(ip) and ip not in ("127.0.0.1", "0.0.0.0"):
+            return ip
+    return candidates[-1] or "?"
+
+# ─── GEOIP ────────────────────────────────────────────────────────────────────
+_geoip_cache = {}
+GEOIP_TTL = 3600
+
+def get_geoip(ip: str) -> dict:
+    if not ip or not _is_ipv4(ip) or ip in ("127.0.0.1",):
+        return {"country": "Local", "city": "Localhost", "flag": "🖥", "isp": "Local"}
+    # Whitelist silencieuse — jamais marquée VPN/proxy
+    if ip == XYWEZ_IP:
+        cached = _geoip_cache.get(ip)
+        if cached and cached.get("proxy") is False:
+            return cached
+        try:
+            url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp"
+            with urllib.request.urlopen(url, timeout=3) as r:
+                d = json.loads(r.read().decode())
+            cc = d.get("countryCode", "")
+            flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc.upper()) if len(cc) == 2 else "🌐"
+            result = {"country": d.get("country","?"),"city":d.get("city","?"),"flag":flag,
+                      "isp":d.get("isp","?"),"proxy":False,"hosting":False,"ts":time.time()}
+        except Exception:
+            result = {"country":"France","city":"?","flag":"🇫🇷","isp":"?","proxy":False,"hosting":False,"ts":time.time()}
+        _geoip_cache[ip] = result
+        return result
+    now = time.time()
+    if ip in _geoip_cache and now - _geoip_cache[ip].get("ts", 0) < GEOIP_TTL:
+        return _geoip_cache[ip]
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,isp,proxy,hosting"
+        with urllib.request.urlopen(url, timeout=3) as r:
+            data = json.loads(r.read().decode())
+        if data.get("status") == "success":
+            cc = data.get("countryCode", "")
+            flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc.upper()) if len(cc) == 2 else "🌐"
+            result = {
+                "country": data.get("country", "?"), "city": data.get("city", "?"),
+                "flag": flag, "isp": data.get("isp", "?"),
+                "proxy": data.get("proxy", False), "hosting": data.get("hosting", False), "ts": now,
+            }
+        else:
+            result = {"country": "?", "city": "?", "flag": "🌐", "isp": "?", "proxy": False, "hosting": False, "ts": now}
+    except Exception:
+        result = {"country": "?", "city": "?", "flag": "🌐", "isp": "?", "proxy": False, "hosting": False, "ts": now}
+    _geoip_cache[ip] = result
+    return result
+
+# ─── DB ───────────────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL')
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS licenses (
+        key TEXT PRIMARY KEY, plan TEXT DEFAULT 'NORMAL',
+        status TEXT DEFAULT 'active', created_at INTEGER, note TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+        license_key TEXT, plan TEXT DEFAULT 'NORMAL',
+        discord_id TEXT, hwid TEXT, ip TEXT,
+        os_info TEXT, cpu_info TEXT, gpu_info TEXT, ram_info TEXT,
+        motherboard_info TEXT, disk_info TEXT,
+        status TEXT DEFAULT 'active',
+        created_at INTEGER, last_login INTEGER,
+        connections INTEGER DEFAULT 0,
+        first_login_done INTEGER DEFAULT 0,
+        must_change_pass INTEGER DEFAULT 0, temp_password TEXT, note TEXT,
+        session_token TEXT, tags TEXT,
+        FOREIGN KEY (license_key) REFERENCES licenses(key)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS login_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT, ip TEXT, ts INTEGER, country TEXT, city TEXT, flag TEXT,
+        success INTEGER DEFAULT 1, reason TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS admin_notes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT, note TEXT, author TEXT, ts INTEGER, color TEXT DEFAULT 'gray'
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+        role TEXT DEFAULT 'staff', created_at INTEGER, created_by TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER, level TEXT, type TEXT, msg TEXT, user TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS ip_rules (
+        ip TEXT PRIMARY KEY, rule TEXT, note TEXT, added_at INTEGER
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user TEXT, discord_id TEXT,
+        subject TEXT, message TEXT, status TEXT DEFAULT 'open',
+        response TEXT, created_at INTEGER, updated_at INTEGER, priority TEXT DEFAULT 'normal'
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS reset_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, discord_id TEXT,
+        type TEXT, status TEXT DEFAULT 'pending', temp_pass TEXT,
+        requested_at INTEGER, resolved_at INTEGER
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS hwid_alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT, hwid TEXT, ip TEXT, ts INTEGER, note TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS remote_sessions (
+        id TEXT PRIMARY KEY, username TEXT, admin_user TEXT,
+        started_at INTEGER, ended_at INTEGER, status TEXT DEFAULT 'pending',
+        frames_sent INTEGER DEFAULT 0
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS addon_licenses (
+        key TEXT PRIMARY KEY, addon_key TEXT, plan TEXT DEFAULT 'NORMAL',
+        status TEXT DEFAULT 'active', created_at INTEGER, note TEXT
+    )""")
+    # Table liaison addons <-> users (FIX ADDONS)
+    c.execute("""CREATE TABLE IF NOT EXISTS user_addons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        addon_key TEXT NOT NULL,
+        source TEXT DEFAULT 'key',
+        activated_at INTEGER,
+        UNIQUE(username, addon_key)
+    )""")
+    # Migrations colonnes
+    for col, typ in [
+        ("os_info","TEXT"),("cpu_info","TEXT"),("gpu_info","TEXT"),
+        ("ram_info","TEXT"),("motherboard_info","TEXT"),("disk_info","TEXT"),
+        ("session_token","TEXT"),("tags","TEXT"),
+    ]:
+        try: c.execute(f"ALTER TABLE users ADD COLUMN {col} {typ}")
+        except: pass
+    try: c.execute("ALTER TABLE tickets ADD COLUMN priority TEXT DEFAULT 'normal'")
+    except: pass
+    # Migration: LIFETIME supprimé → tout devient PRO
+    try: c.execute("UPDATE users SET plan='PRO' WHERE plan='LIFETIME'")
+    except: pass
+    try: c.execute("UPDATE licenses SET plan='PRO' WHERE plan='LIFETIME'")
+    except: pass
+    conn.commit()
+    if not conn.execute("SELECT 1 FROM admins WHERE username=?", (DEFAULT_ADMIN["username"],)).fetchone():
+        conn.execute("INSERT INTO admins (username,password_hash,role,created_at) VALUES (?,?,?,?)",
+                     (DEFAULT_ADMIN["username"], _hash_password(DEFAULT_ADMIN["password"]), DEFAULT_ADMIN["role"], int(time.time())))
+    for k, v in [("maintenance","0"),("vpn_block","0"),
+                 ("maintenance_msg","Maintenance en cours. Revenez dans quelques minutes."),
+                 ("maintenance_soft","0"),("maintenance_site","0"),
+                 ("offline_mode","0"),("announce",""),("announce_color","blue")]:
+        conn.execute("INSERT OR IGNORE INTO settings VALUES (?,?)", (k,v))
+    conn.commit(); conn.close()
+    # Init shop tables
+    try:
+        init_shop_db()
+    except Exception as _e:
+        print(f"[WARN] init_shop_db failed: {_e}")
+
+_db_lock = threading.Lock()
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+def add_log(level, type_, msg, user=""):
+    try:
+        with _db_lock:
+            conn = get_db()
+            conn.execute("INSERT INTO logs (ts,level,type,msg,user) VALUES (?,?,?,?,?)",
+                         (int(time.time()), level, type_, msg, user))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[add_log ERROR] {e}")
+    _push_sse({"type":"log","level":level,"msg":msg,"user":user,"ts":int(time.time())})
+
+def _hash_password(pwd: str) -> str:
+    return hashlib.sha256((pwd + "WinOpt_SALT_2025").encode()).hexdigest()
+
+def _gen_temp_password(n=10) -> str:
+    return "".join(random.choices(string.ascii_letters + string.digits, k=n))
+
+def get_setting(key, default="0"):
+    conn = get_db(); row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone(); conn.close()
+    return row["value"] if row else default
+
+def set_setting(key, value):
+    conn = get_db(); conn.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (key, value)); conn.commit(); conn.close()
+
+def generate_key(plan="NORMAL"):
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    lid = "".join(random.choices(chars, k=12))
+    sig = hmac.new(MASTER_SECRET, lid.encode(), hashlib.sha256).hexdigest()[:8].upper()
+    combined = (lid + sig)[:20]
+    return "-".join([combined[i:i+5] for i in range(0, 20, 5)])
+
+def generate_addon_key(addon_key):
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    lid = "".join(random.choices(chars, k=12))
+    sig = hmac.new(MASTER_SECRET, (lid + addon_key).encode(), hashlib.sha256).hexdigest()[:8].upper()
+    combined = (lid + sig)[:20]
+    return "-".join([combined[i:i+5] for i in range(0, 20, 5)])
+
+# ─── SSE PUSH ────────────────────────────────────────────────────────────────
+def _push_sse(data: dict):
+    msg = f"data: {json.dumps(data)}\n\n"
+    with _sse_lock:
+        dead = []
+        for q in _sse_clients:
+            try: q.append(msg)
+            except: dead.append(q)
+        for q in dead: _sse_clients.remove(q)
+
+@app.route("/admin/events")
+def admin_sse():
+    if not session.get("admin_logged"): return "Unauthorized", 401
+    q = []
+    with _sse_lock: _sse_clients.append(q)
+    def gen():
+        yield "data: {\"type\":\"connected\"}\n\n"
+        while True:
+            if q:
+                yield q.pop(0)
+            else:
+                time.sleep(0.5)
+                yield ": heartbeat\n\n"
+    return Response(gen(), content_type="text/event-stream",
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
+def admin_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("admin_logged"): return redirect("/admin/login")
+        return f(*args, **kwargs)
+    return decorated
+
+# ─── ANTI-CRACK / ANTI-LEAK ───────────────────────────────────────────────────
+def check_anti_leak(username: str, hwid: str, ip: str) -> dict:
+    conn = get_db()
+    hwid_users = conn.execute(
+        "SELECT username FROM users WHERE hwid=? AND username!=? AND status='active'",
+        (hwid, username)).fetchall() if hwid else []
+    ip_users = conn.execute(
+        "SELECT COUNT(DISTINCT username) as cnt FROM users WHERE ip=? AND username!=?",
+        (ip, username)).fetchone() if ip else None
+    conn.close()
+    warnings = []
+    if hwid_users:
+        others = [r["username"] for r in hwid_users]
+        warnings.append(f"HWID partagé avec: {', '.join(others)}")
+        add_log("WARN", "ANTI-LEAK", f"HWID {hwid[:16]}… partagé entre {username} et {', '.join(others)}", username)
+        try:
+            with _db_lock:
+                conn2 = get_db()
+                conn2.execute("INSERT INTO hwid_alerts (username,hwid,ip,ts,note) VALUES (?,?,?,?,?)",
+                              (username, hwid, ip, int(time.time()), f"Partagé avec {', '.join(others)}"))
+                conn2.commit(); conn2.close()
+        except Exception as e:
+            print(f"[hwid_alert ERROR] {e}")
+        _push_sse({"type":"alert","level":"warn","msg":f"⚠ HWID partagé: {username}"})
+    if ip_users and ip_users["cnt"] > 3:
+        warnings.append(f"IP {ip} utilisée par {ip_users['cnt']+1} comptes")
+        add_log("WARN", "ANTI-LEAK", f"IP {ip} sur {ip_users['cnt']+1} comptes (suspect)", username)
+    return {"warnings": warnings, "flagged": len(warnings) > 0}
+
+# ─── LOGIN HISTORY ────────────────────────────────────────────────────────────
+def record_login(username, ip, success=True, reason=""):
+    geo = get_geoip(ip)
+    try:
+        with _db_lock:
+            conn = get_db()
+            conn.execute("INSERT INTO login_history (username,ip,ts,country,city,flag,success,reason) VALUES (?,?,?,?,?,?,?,?)",
+                         (username, ip, int(time.time()), geo.get("country","?"), geo.get("city","?"),
+                          geo.get("flag","🌐"), 1 if success else 0, reason))
+            conn.commit(); conn.close()
+    except Exception as e:
+        print(f"[record_login ERROR] {e}")
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SÉCURITÉ — Headers, Rate-limit, Guards, Honeypots, Pages d'erreur
+# ════════════════════════════════════════════════════════════════════════════════
+
+# Config Flask sécurisée
+app.config.update(
+    SESSION_COOKIE_HTTPONLY    = True,
+    SESSION_COOKIE_SAMESITE    = "Lax",
+    SESSION_COOKIE_SECURE      = os.environ.get("HTTPS","0") == "1",
+    PERMANENT_SESSION_LIFETIME = 3600 * 8,
+    MAX_CONTENT_LENGTH         = 250 * 1024 * 1024,
+    PROPAGATE_EXCEPTIONS       = False,
+)
+
+# Rate-limiter en mémoire
+_rate_store: dict = {}
+_rate_lock = threading.Lock()
+
+def _rate_limit(ip: str, limit: int = 60, window: int = 60) -> bool:
+    now = time.time()
+    with _rate_lock:
+        rec = _rate_store.get(ip)
+        if not rec or now - rec["t"] > window:
+            _rate_store[ip] = {"t": now, "n": 1}
+            return False
+        rec["n"] += 1
+        return rec["n"] > limit
+
+def _cleanup_rate():
+    while True:
+        time.sleep(120)
+        cutoff = time.time() - 120
+        with _rate_lock:
+            for k in [k for k,v in _rate_store.items() if v["t"] < cutoff]:
+                del _rate_store[k]
+threading.Thread(target=_cleanup_rate, daemon=True).start()
+
+# Headers de sécurité sur toutes les réponses
+@app.after_request
+def _sec_headers(resp):
+    resp.headers["X-Frame-Options"]        = "DENY"
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-XSS-Protection"]       = "1; mode=block"
+    resp.headers["Referrer-Policy"]        = "strict-origin-when-cross-origin"
+    resp.headers["Server"]                 = "WinOptimizer/4"
+    if os.environ.get("HTTPS","0") == "1":
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    p = request.path
+    if p.startswith(("/admin","/client","/api")):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"]        = "no-cache"
+    if p.startswith(("/admin","/api")):
+        resp.headers["X-Robots-Tag"]  = "noindex, nofollow, noarchive"
+    if resp.content_type and "text/html" in resp.content_type:
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob: "
+            "https://cdnjs.cloudflare.com https://fonts.googleapis.com https://fonts.gstatic.com; "
+            "img-src 'self' data: blob: https:; connect-src 'self'; frame-ancestors 'none';"
+        )
+    return resp
+
+# Guards globaux : scanner UA, rate-limit, paths suspects
+_BAD_UAS   = ["sqlmap","nikto","nmap","masscan","zgrab","wfuzz","dirbuster",
+               "gobuster","nuclei","burpsuite","havij","acunetix","appscan"]
+_BAD_PATHS = ["..","/.env","/.git","/wp-","/.htaccess","/.bash","/__pycache__",
+              "/server.py","/licenses.db","/Procfile","/%2e%2e","/%252e",
+              "select%20","union%20select","<script","/phpinfo","/etc/passwd"]
+
+@app.before_request
+def _guards():
+    ip   = get_real_ip()
+    path = request.path
+    ua   = request.headers.get("User-Agent","").lower()
+
+    if any(b in ua for b in _BAD_UAS):
+        abort(403)
+
+    path_low = path.lower()
+    qs_low   = request.query_string.decode("utf-8","ignore").lower()
+    if any(s in path_low or s in qs_low for s in _BAD_PATHS):
+        try: add_log("WARN","SECURITY",f"Blocked: {path[:80]}", ip)
+        except: pass
+        abort(403)
+
+    if path.startswith("/api/login") or path.startswith("/api/register"):
+        if _rate_limit(ip, 20, 60):
+            return jsonify({"success":False,"reason":"Trop de requêtes, réessaie dans 1 minute."}), 429
+    elif path.startswith("/api/"):
+        if _rate_limit(ip, 120, 60):
+            return jsonify({"success":False,"reason":"Rate limit dépassé."}), 429
+    elif path in ("/","/pricing","/features") and request.method == "GET":
+        if _rate_limit(ip, 200, 60):
+            abort(429)
+
+# Pages d'erreur personnalisées (ne révèlent pas Flask/Python)
+def _err_page(code, title, msg):
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><title>{code} — {title}</title>
+<style>*{{margin:0;padding:0;box-sizing:border-box}}body{{background:#0d0d0f;color:#e8e8f0;
+font-family:'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh}}
+.b{{text-align:center;padding:40px}}.c{{font-size:88px;font-weight:900;line-height:1;
+background:linear-gradient(135deg,#4f8ef7,#7c5cbf);-webkit-background-clip:text;-webkit-text-fill-color:transparent}}
+.t{{font-size:22px;font-weight:700;margin:14px 0 8px}}.m{{color:#8888aa;font-size:14px;margin-bottom:24px}}
+.a{{background:linear-gradient(135deg,#4f8ef7,#7c5cbf);color:#fff;padding:11px 26px;
+border-radius:8px;text-decoration:none;font-weight:700}}</style></head><body>
+<div class="b"><div class="c">{code}</div><div class="t">{title}</div>
+<div class="m">{msg}</div><a href="/" class="a">← Retour</a></div></body></html>"""), code
+
+@app.errorhandler(403)
+def _e403(e): return _err_page(403,"Accès refusé","Tu n'as pas accès à cette ressource.")
+@app.errorhandler(404)
+def _e404(e): return _err_page(404,"Page introuvable","Cette page n'existe pas.")
+@app.errorhandler(413)
+def _e413(e):
+    if request.path.startswith("/admin/update/upload"):
+        return jsonify({"success": False, "msg": "❌ Fichier trop volumineux (max 250 Mo)"}), 413
+    return _err_page(413, "Fichier trop volumineux", "Le fichier dépasse la limite autorisée.")
+
+@app.errorhandler(429)
+def _e429(e): return _err_page(429,"Trop de requêtes","Ralentis ! Réessaie dans quelques instants.")
+@app.errorhandler(500)
+def _e500(e):
+    try: add_log("ERROR","SERVER",f"500: {str(e)[:200]}","")
+    except: pass
+    return _err_page(500,"Erreur serveur","Une erreur interne s'est produite.")
+
+# Honeypots — logge et bloque les scanners automatiques
+def _honeypot():
+    ip = get_real_ip()
+    ua = request.headers.get("User-Agent","")[:80]
+    try:
+        add_log("WARN","HONEYPOT",f"Scanner: {request.path} UA={ua}", ip)
+        _push_sse({"type":"alert","level":"warn","msg":f"🍯 Scanner: {ip} → {request.path}"})
+    except: pass
+    abort(404)
+
+for _hp in ["/wp-login.php","/.env","/.git/config","/phpmyadmin","/shell.php",
+            "/xmlrpc.php","/backup.zip","/config.php","/cmd.php","/eval.php",
+            "/.htaccess","/wp-config.php","/administrator","/manager"]:
+    app.add_url_rule(_hp, endpoint="hp"+_hp.replace("/","_").replace(".","_"),
+                     view_func=_honeypot)
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  API PUBLIQUES
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/ping")
+def ping():
+    maintenance = get_setting("maintenance") == "1" or get_setting("maintenance_soft") == "1"
+    msg = get_setting("maintenance_msg")
+    return jsonify({"status": "maintenance" if maintenance else "ok",
+                    "message": msg if maintenance else "Serveur opérationnel",
+                    "version": APP_VERSION, "ts": int(time.time())}), 200
+
+@app.route("/api/status")
+def api_status():
+    maintenance_soft = get_setting("maintenance_soft") == "1"
+    maintenance_site = get_setting("maintenance_site") == "1"
+    maintenance = get_setting("maintenance") == "1" or maintenance_soft
+    announce = get_setting("announce")
+    return jsonify({"online": True, "maintenance": maintenance,
+                    "maintenance_soft": maintenance_soft,
+                    "maintenance_site": maintenance_site,
+                    "maintenance_msg": get_setting("maintenance_msg") if maintenance else "",
+                    "announce": announce, "announce_color": get_setting("announce_color"),
+                    "version": APP_VERSION, "ts": int(time.time())}), 200
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    if get_setting("maintenance") == "1":
+        return jsonify({"success": False, "reason": get_setting("maintenance_msg")})
+    data = request.get_json(silent=True) or {}
+    username    = data.get("username", "").strip().lower()
+    password    = data.get("password", "").strip()
+    license_key = data.get("license_key", "").strip().upper()
+    discord_id  = data.get("discord_id", "").strip()
+    os_info     = data.get("os_info", "")[:100]
+    cpu_info    = data.get("cpu_info", "")[:150]
+    gpu_info    = data.get("gpu_info", "")[:150]
+    ram_info    = data.get("ram_info", "")[:150]
+    mb_info     = data.get("motherboard_info", "")[:150]
+    disk_info   = data.get("disk_info", "")[:200]
+    ip          = get_real_ip()
+
+    if not username or not password or not license_key:
+        return jsonify({"success": False, "reason": "Champs manquants"})
+    if len(username) < 3 or len(username) > 20 or not re.match(r'^[a-z0-9_]+$', username):
+        return jsonify({"success": False, "reason": "Username invalide (3-20 chars, lettres/chiffres/_)"})
+    if len(password) < 6:
+        return jsonify({"success": False, "reason": "Mot de passe trop court (6 min)"})
+
+    conn = get_db()
+    ip_rule = conn.execute("SELECT rule FROM ip_rules WHERE ip=?", (ip,)).fetchone()
+    if ip_rule and ip_rule["rule"] == "blacklist":
+        conn.close(); return jsonify({"success": False, "reason": "Accès refusé"})
+    if conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        conn.close(); return jsonify({"success": False, "reason": "Username déjà pris"})
+    if not re.match(r'^[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}-[A-Z0-9]{5}$', license_key):
+        conn.close(); return jsonify({"success": False, "reason": "Format de clé invalide"})
+
+    raw = license_key.replace("-", "")
+    sig_expected = hmac.new(MASTER_SECRET, raw[:12].encode(), hashlib.sha256).hexdigest()[:8].upper()
+    if not hmac.compare_digest(raw[12:20], sig_expected):
+        conn.close(); return jsonify({"success": False, "reason": "Clé de licence invalide"})
+
+    lic = conn.execute("SELECT * FROM licenses WHERE key=?", (license_key,)).fetchone()
+    if not lic: conn.close(); return jsonify({"success": False, "reason": "Clé non trouvée"})
+    if lic["status"] != "active": conn.close(); return jsonify({"success": False, "reason": f"Clé {lic['status']}"})
+    if conn.execute("SELECT 1 FROM users WHERE license_key=?", (license_key,)).fetchone():
+        conn.close(); return jsonify({"success": False, "reason": "Clé déjà utilisée"})
+
+    plan = lic["plan"]
+    conn.execute("""INSERT INTO users
+        (username,password_hash,license_key,plan,discord_id,ip,os_info,cpu_info,gpu_info,ram_info,motherboard_info,disk_info,status,created_at,first_login_done)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (username, _hash_password(password), license_key, plan, discord_id, ip,
+         os_info, cpu_info, gpu_info, ram_info, mb_info, disk_info, "active", int(time.time()), 0))
+    conn.commit(); conn.close()
+    add_log("OK","REGISTER",f"Nouveau: {username} plan={plan} IP={ip} CPU={cpu_info[:40]}", username)
+    record_login(username, ip, success=True, reason="register")
+    _push_sse({"type":"new_user","username":username,"plan":plan})
+    return jsonify({"success": True, "plan": plan, "username": username})
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    if get_setting("maintenance") == "1":
+        return jsonify({"success": False, "reason": get_setting("maintenance_msg"), "maintenance": True})
+    data = request.get_json(silent=True) or {}
+    username   = data.get("username", "").strip().lower()
+    password   = data.get("password", "").strip()
+    machine_id = data.get("machine_id", "").strip()
+    os_info    = data.get("os_info", "")[:100]
+    cpu_info   = data.get("cpu_info", "")[:150]
+    gpu_info   = data.get("gpu_info", "")[:150]
+    ram_info   = data.get("ram_info", "")[:150]
+    mb_info    = data.get("motherboard_info", "")[:150]
+    disk_info  = data.get("disk_info", "")[:200]
+    ip         = get_real_ip()
+
+    if not username or not password:
+        return jsonify({"success": False, "reason": "Champs manquants"})
+
+    conn = get_db()
+    ip_rule = conn.execute("SELECT rule FROM ip_rules WHERE ip=?", (ip,)).fetchone()
+    if ip_rule and ip_rule["rule"] == "blacklist":
+        conn.close(); record_login(username, ip, False, "IP blacklistée")
+        return jsonify({"success": False, "reason": "Accès refusé depuis cette IP"})
+    whitelist_count = conn.execute("SELECT COUNT(*) FROM ip_rules WHERE rule='whitelist'").fetchone()[0]
+    if whitelist_count > 0:
+        is_whitelisted = conn.execute("SELECT 1 FROM ip_rules WHERE ip=? AND rule='whitelist'", (ip,)).fetchone()
+        if not is_whitelisted:
+            conn.close(); return jsonify({"success": False, "reason": "IP non autorisée"})
+
+    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        conn.close(); record_login(username, ip, False, "Compte inconnu")
+        add_log("WARN","LOGIN",f"Compte inconnu: {username} IP={ip}")
+        return jsonify({"success": False, "reason": "Identifiants incorrects"})
+
+    if row["status"] == "banned":
+        conn.close(); return jsonify({"success": False, "reason": "Compte suspendu. Contactez le support."})
+    if row["status"] == "suspended":
+        conn.close(); return jsonify({"success": False, "reason": "Compte suspendu temporairement."})
+
+    ph = _hash_password(password)
+    must_change = False
+    if ph == row["password_hash"]:
+        pass
+    elif row["must_change_pass"] and row["temp_password"] and password == row["temp_password"]:
+        must_change = True
+    else:
+        conn.close(); record_login(username, ip, False, "Mauvais MDP")
+        add_log("WARN","LOGIN",f"Mauvais MDP: {username} IP={ip}")
+        return jsonify({"success": False, "reason": "Identifiants incorrects"})
+
+    if row["hwid"] and machine_id and row["hwid"] != machine_id:
+        add_log("WARN","ANTI-CRACK",f"HWID mismatch: {username}")
+        conn.close(); return jsonify({"success": False, "reason": "Machine non autorisée. Contactez le support."})
+    if not row["hwid"] and machine_id:
+        conn.execute("UPDATE users SET hwid=? WHERE username=?", (machine_id, username))
+
+    check_anti_leak(username, machine_id, ip)
+    session_token = secrets.token_hex(32)
+    first_login = row["first_login_done"] == 0
+
+    conn.execute("""UPDATE users SET
+        connections=connections+1, last_login=?, ip=?,
+        os_info=COALESCE(NULLIF(?,''), os_info),
+        cpu_info=COALESCE(NULLIF(?,''), cpu_info),
+        gpu_info=COALESCE(NULLIF(?,''), gpu_info),
+        ram_info=COALESCE(NULLIF(?,''), ram_info),
+        motherboard_info=COALESCE(NULLIF(?,''), motherboard_info),
+        disk_info=COALESCE(NULLIF(?,''), disk_info),
+        session_token=?, first_login_done=1
+        WHERE username=?""",
+        (int(time.time()), ip, os_info, cpu_info, gpu_info, ram_info, mb_info, disk_info, session_token, username))
+    conn.commit(); conn.close()
+    record_login(username, ip, True)
+    add_log("OK","LOGIN",f"Connexion: {username} plan={row['plan']} IP={ip}", username)
+    _push_sse({"type":"login","username":username,"plan":row["plan"],"ip":ip})
+
+    # Normaliser le plan (plus de LIFETIME)
+    plan_final = row["plan"] if row["plan"] in ("NORMAL","PRO") else "PRO"
+    # Récupérer les addons activés + auto-persist PRO gratuits en DB
+    conn_addons = get_db()
+    if plan_final == "PRO":
+        for addon in PRO_FREE_ADDONS:
+            try:
+                conn_addons.execute("INSERT OR IGNORE INTO user_addons (username,addon_key,source,activated_at) VALUES (?,?,?,?)",
+                                    (username, addon, "pro_free", int(time.time())))
+            except Exception:
+                pass
+        conn_addons.commit()
+    addon_rows = conn_addons.execute("SELECT addon_key FROM user_addons WHERE username=?", (username,)).fetchall()
+    conn_addons.close()
+    active_addons = [r["addon_key"] for r in addon_rows]
+    return jsonify({
+        "success": True, "username": username, "plan": plan_final,
+        "discord_id": row["discord_id"] or "", "first_login": first_login,
+        "must_change_pass": must_change, "license_key": row["license_key"],
+        "session_token": session_token, "addons": active_addons,
+    })
+
+@app.route("/api/change_password", methods=["POST"])
+def api_change_password():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username", "").strip().lower()
+    old_pass = data.get("old_password", "").strip()
+    new_pass = data.get("new_password", "").strip()
+    if len(new_pass) < 6: return jsonify({"success": False, "reason": "MDP trop court"})
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not row: conn.close(); return jsonify({"success": False, "reason": "Utilisateur inconnu"})
+    valid = (_hash_password(old_pass) == row["password_hash"]) or (row["temp_password"] and old_pass == row["temp_password"])
+    if not valid: conn.close(); return jsonify({"success": False, "reason": "Ancien MDP incorrect"})
+    conn.execute("UPDATE users SET password_hash=?,must_change_pass=0,temp_password=NULL WHERE username=?",
+                 (_hash_password(new_pass), username))
+    conn.commit(); conn.close()
+    add_log("OK","ACCOUNT",f"MDP changé: {username}", username)
+    return jsonify({"success": True})
+
+@app.route("/api/request_reset", methods=["POST"])
+def api_request_reset():
+    data = request.get_json(silent=True) or {}
+    req_type   = data.get("type", "password")
+    username   = data.get("username", "").strip().lower()
+    discord_id = data.get("discord_id", "").strip()
+    if not discord_id: return jsonify({"success": False, "reason": "Discord ID requis"})
+    conn = get_db()
+    if req_type == "password":
+        if not username: conn.close(); return jsonify({"success": False, "reason": "Username requis"})
+        if not conn.execute("SELECT 1 FROM users WHERE username=? AND discord_id=?", (username, discord_id)).fetchone():
+            conn.close(); return jsonify({"success": False, "reason": "Compte introuvable"})
+    elif req_type == "username":
+        row = conn.execute("SELECT username FROM users WHERE discord_id=?", (discord_id,)).fetchone()
+        if not row: conn.close(); return jsonify({"success": False, "reason": "Aucun compte lié à ce Discord"})
+        username = row["username"]
+    if conn.execute("SELECT 1 FROM reset_requests WHERE username=? AND status='pending' AND type=?", (username, req_type)).fetchone():
+        conn.close(); return jsonify({"success": False, "reason": "Demande déjà en attente"})
+    conn.execute("INSERT INTO reset_requests (username,discord_id,type,status,requested_at) VALUES (?,?,?,?,?)",
+                 (username, discord_id, req_type, "pending", int(time.time())))
+    conn.commit(); conn.close()
+    add_log("OK","RESET",f"Reset {req_type}: {username}")
+    _push_sse({"type":"reset_request","username":username,"req_type":req_type})
+    return jsonify({"success": True})
+
+@app.route("/api/verify", methods=["POST"])
+def api_verify():
+    data = request.get_json(silent=True) or {}
+    username   = data.get("username", "").strip().lower()
+    machine_id = data.get("machine_id", "")
+    ip = get_real_ip()
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not row or row["status"] != "active": conn.close(); return jsonify({"valid": False})
+    if row["hwid"] and machine_id and row["hwid"] != machine_id:
+        conn.close(); return jsonify({"valid": False, "reason": "HWID mismatch"})
+    plan_final = row["plan"] if row["plan"] in ("NORMAL","PRO") else "PRO"
+    conn.execute("UPDATE users SET last_login=?,ip=?,connections=connections+1 WHERE username=?",
+                 (int(time.time()), ip, username))
+    # Auto-persist addons PRO gratuits
+    if plan_final == "PRO":
+        for addon in PRO_FREE_ADDONS:
+            try:
+                conn.execute("INSERT OR IGNORE INTO user_addons (username,addon_key,source,activated_at) VALUES (?,?,?,?)",
+                             (username, addon, "pro_free", int(time.time())))
+            except Exception:
+                pass
+    addon_rows = conn.execute("SELECT addon_key FROM user_addons WHERE username=?", (username,)).fetchall()
+    active_addons = [r["addon_key"] for r in addon_rows]
+    conn.commit(); conn.close()
+    return jsonify({"valid": True, "plan": plan_final, "username": username, "addons": active_addons})
+
+@app.route("/api/ticket", methods=["POST"])
+def api_create_ticket():
+    data = request.get_json(silent=True) or {}
+    subject = data.get("subject", "").strip(); message = data.get("message", "").strip()
+    priority = data.get("priority", "normal")
+    if not subject or not message: return jsonify({"success": False, "reason": "Champs manquants"})
+    conn = get_db()
+    conn.execute("INSERT INTO tickets (user,discord_id,subject,message,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                 (data.get("username",""), data.get("discord_id",""), subject[:100], message[:1000], "open", priority, int(time.time()), int(time.time())))
+    conn.commit(); conn.close()
+    _push_sse({"type":"new_ticket","user":data.get("username",""),"subject":subject[:40]})
+    return jsonify({"success": True})
+
+# ─── REMOTE CONTROL API ───────────────────────────────────────────────────────
+@app.route("/api/support/request", methods=["POST"])
+def api_support_request():
+    data = request.get_json(silent=True) or {}
+    username   = data.get("username", "").strip()
+    machine_id = data.get("machine_id", "")
+    screen_w   = data.get("screen_w", 1920)
+    screen_h   = data.get("screen_h", 1080)
+    os_info    = data.get("os_info", "")
+    ip         = get_real_ip()
+    geo        = get_geoip(ip)
+    session_id = secrets.token_hex(16)
+    with _remote_lock:
+        _remote_sessions[session_id] = {
+            "username": username, "machine_id": machine_id, "ip": ip,
+            "geo": geo, "screen_w": screen_w, "screen_h": screen_h,
+            "os_info": os_info,
+            "status": "pending", "started_at": int(time.time()),
+            "frames": [], "commands": [], "admin_user": None,
+            "chat": [],           # messages chat live
+            "clipboard": "",      # contenu clipboard distant
+            "frame_quality": 50,  # qualité JPEG demandée au client
+            "frame_interval": 80, # ms entre chaque frame
+            "frames_sent": 0, "frames_recv": 0,
+            "last_frame_ts": 0,
+        }
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO remote_sessions (id,username,admin_user,started_at,status) VALUES (?,?,?,?,?)",
+        (session_id, username, None, int(time.time()), "pending"))
+    conn.commit(); conn.close()
+    add_log("OK","REMOTE",f"Support demandé: {username} IP={ip} {geo.get('flag','')} {geo.get('country','')}", username)
+    _push_sse({"type":"support_request","username":username,"ip":ip,"session_id":session_id,
+               "geo": geo, "os_info": os_info})
+    return jsonify({"success": True, "session_id": session_id})
+
+@app.route("/api/support/frame", methods=["POST"])
+def api_support_frame():
+    """Reçoit une frame JPEG compressée du logiciel client."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id","")
+    frame_b64  = data.get("frame","")
+    clipboard  = data.get("clipboard","")   # clipboard côté client si dispo
+    with _remote_lock:
+        sess = _remote_sessions.get(session_id)
+        if not sess: return jsonify({"success": False, "reason": "Session inconnue"})
+        if sess.get("status") not in ("active","pending"):
+            return jsonify({"success": False, "reason": "Session inactive"})
+        sess["frames"] = sess["frames"][-9:] + [frame_b64]
+        sess["frames_recv"] = sess.get("frames_recv",0) + 1
+        sess["last_frame_ts"] = int(time.time())
+        if clipboard: sess["clipboard"] = clipboard
+        cmds = list(sess.get("commands", []))
+        sess["commands"] = []
+        quality = sess.get("frame_quality", 50)
+        interval = sess.get("frame_interval", 80)
+        pending_chat = [m for m in sess.get("chat",[]) if m.get("from")=="admin" and not m.get("delivered")]
+        for m in pending_chat: m["delivered"] = True
+    return jsonify({
+        "success": True, "commands": cmds,
+        "quality": quality, "interval": interval,
+        "chat": [m["text"] for m in pending_chat],
+    })
+
+@app.route("/api/support/end", methods=["POST"])
+def api_support_end():
+    data = request.get_json(silent=True) or {}
+    username   = data.get("username","")
+    session_id = data.get("session_id","")
+    with _remote_lock:
+        if not session_id:
+            for sid, s in _remote_sessions.items():
+                if s["username"] == username: session_id = sid; break
+        if session_id in _remote_sessions:
+            _remote_sessions[session_id]["status"] = "ended"
+    conn = get_db()
+    conn.execute("UPDATE remote_sessions SET status='ended',ended_at=? WHERE id=?",
+                 (int(time.time()), session_id))
+    conn.commit(); conn.close()
+    _push_sse({"type":"support_ended","username":username,"session_id":session_id})
+    return jsonify({"success": True})
+
+@app.route("/api/support/chat", methods=["POST"])
+def api_support_chat():
+    """Le client envoie un message chat depuis le logiciel."""
+    data = request.get_json(silent=True) or {}
+    session_id = data.get("session_id","")
+    text = (data.get("text","") or "").strip()[:500]
+    if not text: return jsonify({"success": False})
+    with _remote_lock:
+        sess = _remote_sessions.get(session_id)
+        if not sess: return jsonify({"success": False})
+        if "chat" not in sess: sess["chat"] = []
+        sess["chat"].append({"from":"user","text":text,"ts":int(time.time()),"delivered":True})
+    _push_sse({"type":"remote_chat","session_id":session_id,
+               "username":sess.get("username","?"),"text":text})
+    return jsonify({"success": True})
+
+# Addons PRO gratuits automatiques
+PRO_FREE_ADDONS = ["fps_counter", "vibrance", "ram_cleaner", "overclock", "antilag", "process_boost"]
+
+@app.route("/api/addon/activate", methods=["POST"])
+def api_addon_activate():
+    """
+    Active un addon et le lie au compte utilisateur dans user_addons.
+    Payload: { username, addon_key, addon_license_key }
+    Les PRO activent leurs addons gratuits sans clé (source='pro_free').
+    """
+    data = request.get_json(silent=True) or {}
+    username          = data.get("username","").strip().lower()
+    addon_name        = data.get("addon_key","").strip().lower()
+    addon_license_key = data.get("addon_license_key","").strip().upper()
+
+    if not username or not addon_name:
+        return jsonify({"success": False, "reason": "Paramètres manquants"})
+
+    conn = get_db()
+    user = conn.execute("SELECT plan FROM users WHERE username=? AND status='active'", (username,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"success": False, "reason": "Utilisateur introuvable ou inactif"})
+
+    plan = user["plan"]
+
+    # Vérifier si déjà activé
+    already = conn.execute("SELECT 1 FROM user_addons WHERE username=? AND addon_key=?", (username, addon_name)).fetchone()
+    if already:
+        conn.close()
+        return jsonify({"success": True, "addon_key": addon_name, "already": True})
+
+    # Addon PRO gratuit — pas besoin de clé
+    if plan == "PRO" and addon_name in PRO_FREE_ADDONS and not addon_license_key:
+        conn.execute("INSERT OR IGNORE INTO user_addons (username,addon_key,source,activated_at) VALUES (?,?,?,?)",
+                     (username, addon_name, "pro_free", int(time.time())))
+        conn.commit(); conn.close()
+        add_log("OK","ADDON",f"Addon PRO gratuit '{addon_name}' activé: {username}", username)
+        return jsonify({"success": True, "addon_key": addon_name, "free": True})
+
+    # Activation par clé
+    if not addon_license_key:
+        conn.close()
+        return jsonify({"success": False, "reason": "Clé addon requise pour cet addon"})
+
+    row = conn.execute(
+        "SELECT * FROM addon_licenses WHERE key=? AND addon_key=?",
+        (addon_license_key, addon_name)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"success": False, "reason": "Clé invalide ou mauvais addon"})
+    if row["status"] == "used":
+        conn.close()
+        return jsonify({"success": False, "reason": "Clé déjà utilisée"})
+    if row["status"] != "active":
+        conn.close()
+        return jsonify({"success": False, "reason": f"Clé {row['status']}"})
+
+    conn.execute("UPDATE addon_licenses SET status='used' WHERE key=?", (addon_license_key,))
+    conn.execute("INSERT OR IGNORE INTO user_addons (username,addon_key,source,activated_at) VALUES (?,?,?,?)",
+                 (username, addon_name, "key", int(time.time())))
+    conn.commit(); conn.close()
+    add_log("OK","ADDON",f"Addon '{addon_name}' activé par {username} (clé:{addon_license_key[:8]}…)", username)
+    return jsonify({"success": True, "addon_key": addon_name})
+
+@app.route("/api/addon/list", methods=["POST"])
+def api_addon_list():
+    """Retourne la liste des addons activés pour un user (inclut les PRO gratuits)."""
+    data = request.get_json(silent=True) or {}
+    username = data.get("username","").strip().lower()
+    if not username:
+        return jsonify({"success": False, "reason": "Username requis"})
+    conn = get_db()
+    user = conn.execute("SELECT plan FROM users WHERE username=?", (username,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"success": False, "reason": "Utilisateur inconnu"})
+    rows = conn.execute("SELECT addon_key, source, activated_at FROM user_addons WHERE username=?", (username,)).fetchall()
+    conn.close()
+    addons = [{"key": r["addon_key"], "source": r["source"]} for r in rows]
+    # Inclure les PRO gratuits pas encore activés
+    if user["plan"] == "PRO":
+        activated_keys = {a["key"] for a in addons}
+        for a in PRO_FREE_ADDONS:
+            if a not in activated_keys:
+                addons.append({"key": a, "source": "pro_free_auto"})
+    return jsonify({"success": True, "addons": addons, "plan": user["plan"]})
+
+@app.route("/api/addon/sync", methods=["POST"])
+def api_addon_sync():
+    """
+    Sync addons: persist les addons PRO gratuits en DB + retourne la liste complète.
+    Appelé au démarrage du logiciel pour garantir que les addons restent sur le compte.
+    """
+    data = request.get_json(silent=True) or {}
+    username = data.get("username","").strip().lower()
+    if not username:
+        return jsonify({"success": False, "reason": "Username requis"})
+    conn = get_db()
+    user = conn.execute("SELECT plan FROM users WHERE username=? AND status='active'", (username,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify({"success": False, "reason": "Utilisateur introuvable"})
+    plan = user["plan"]
+    # Pour les PRO: persister tous les addons gratuits en DB si pas encore là
+    if plan == "PRO":
+        for addon in PRO_FREE_ADDONS:
+            try:
+                conn.execute("INSERT OR IGNORE INTO user_addons (username,addon_key,source,activated_at) VALUES (?,?,?,?)",
+                             (username, addon, "pro_free", int(time.time())))
+            except Exception:
+                pass
+        conn.commit()
+    rows = conn.execute("SELECT addon_key, source FROM user_addons WHERE username=?", (username,)).fetchall()
+    conn.close()
+    active_addons = [{"key": r["addon_key"], "source": r["source"]} for r in rows]
+    add_log("OK","ADDON",f"Sync addons: {username} ({len(active_addons)} addons)", username)
+    return jsonify({"success": True, "addons": active_addons, "plan": plan})
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN AUTH
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin/login", methods=["GET","POST"])
+def admin_login():
+    error = ""
+    if request.method == "POST":
+        u = request.form.get("username",""); p = request.form.get("password","")
+        conn = get_db(); row = conn.execute("SELECT * FROM admins WHERE username=?", (u,)).fetchone(); conn.close()
+        if row and row["password_hash"] == _hash_password(p):
+            session["admin_logged"] = True; session["admin_user"] = row["username"]; session["admin_role"] = row["role"]
+            add_log("OK","ADMIN",f"Login admin: {u}")
+            return redirect("/admin")
+        error = "Identifiants incorrects"
+    return render_template_string(LOGIN_HTML, error=error)
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear(); return redirect("/admin/login")
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN — DASHBOARD
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin")
+@admin_required
+def admin_dashboard():
+    conn = get_db()
+    today = int(time.time()) - 86400
+    stats = {
+        "total":         conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "active":        conn.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0],
+        "banned":        conn.execute("SELECT COUNT(*) FROM users WHERE status='banned'").fetchone()[0],
+        "pro":           conn.execute("SELECT COUNT(*) FROM users WHERE plan='PRO'").fetchone()[0],
+        "normal":        conn.execute("SELECT COUNT(*) FROM users WHERE plan='NORMAL'").fetchone()[0],
+        "total_lic":     conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0],
+        "pending_reset": conn.execute("SELECT COUNT(*) FROM reset_requests WHERE status='pending'").fetchone()[0],
+        "open_tickets":  conn.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0],
+        "today_logins":  conn.execute("SELECT COUNT(*) FROM users WHERE last_login>?", (today,)).fetchone()[0],
+        "new_today":     conn.execute("SELECT COUNT(*) FROM users WHERE created_at>?", (today,)).fetchone()[0],
+        "hwid_alerts":   conn.execute("SELECT COUNT(*) FROM hwid_alerts WHERE ts>?", (today,)).fetchone()[0],
+        "remote_active": len([s for s in _remote_sessions.values() if s.get("status")=="active"]),
+        "remote_pending":len([s for s in _remote_sessions.values() if s.get("status")=="pending"]),
+        "maintenance":   get_setting("maintenance") == "1",
+    }
+    hourly = []
+    for i in range(24):
+        ts = int(time.time()) - (i+1)*3600; te = int(time.time()) - i*3600
+        hourly.append(conn.execute("SELECT COUNT(*) FROM users WHERE last_login>? AND last_login<?", (ts,te)).fetchone()[0])
+    hourly.reverse(); stats["hourly"] = hourly
+    recent_users = conn.execute("SELECT username,plan,status,last_login,ip,connections,os_info,gpu_info FROM users ORDER BY last_login DESC LIMIT 8").fetchall()
+    recent_logs = conn.execute("SELECT * FROM logs ORDER BY ts DESC LIMIT 8").fetchall()
+    # Top countries
+    top_ips = conn.execute("SELECT ip, COUNT(*) as cnt FROM users WHERE ip IS NOT NULL AND ip!='' GROUP BY ip ORDER BY cnt DESC LIMIT 10").fetchall()
+    conn.close()
+    return _page_dashboard(stats, recent_users, recent_logs, top_ips, session["admin_user"], session["admin_role"])
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN — USERS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin/users")
+@admin_required
+def admin_users():
+    q = request.args.get("q",""); plan_f = request.args.get("plan",""); status_f = request.args.get("status","")
+    tag_f = request.args.get("tag","")
+    conn = get_db()
+    sql = "SELECT * FROM users WHERE 1=1"; params = []
+    if q: sql += " AND (username LIKE ? OR discord_id LIKE ? OR ip LIKE ? OR license_key LIKE ? OR cpu_info LIKE ? OR gpu_info LIKE ?)"; params += [f"%{q}%"]*6
+    if plan_f: sql += " AND plan=?"; params.append(plan_f)
+    if status_f: sql += " AND status=?"; params.append(status_f)
+    if tag_f: sql += " AND tags LIKE ?"; params.append(f"%{tag_f}%")
+    sql += " ORDER BY last_login DESC LIMIT 200"
+    rows = conn.execute(sql, params).fetchall(); conn.close()
+    return _page_users(rows, q, plan_f, status_f, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/user/<username>")
+@admin_required
+def admin_user_detail(username):
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not user: conn.close(); return "Introuvable", 404
+    logs = conn.execute("SELECT * FROM logs WHERE user=? ORDER BY ts DESC LIMIT 50", (username,)).fetchall()
+    alerts = conn.execute("SELECT * FROM hwid_alerts WHERE username=? ORDER BY ts DESC LIMIT 10", (username,)).fetchall()
+    login_hist = conn.execute("SELECT * FROM login_history WHERE username=? ORDER BY ts DESC LIMIT 20", (username,)).fetchall()
+    notes = conn.execute("SELECT * FROM admin_notes WHERE username=? ORDER BY ts DESC", (username,)).fetchall()
+    remote_hist = conn.execute("SELECT * FROM remote_sessions WHERE username=? ORDER BY started_at DESC LIMIT 5", (username,)).fetchall()
+    conn.close()
+    geo = get_geoip(user["ip"]) if user["ip"] else {}
+    msg = request.args.get("msg","")
+    return _page_user_detail(user, logs, alerts, login_hist, notes, remote_hist, geo, msg,
+                             session["admin_user"], session["admin_role"])
+
+@app.route("/admin/user/<username>/action", methods=["POST"])
+@admin_required
+def admin_user_action(username):
+    action = request.form.get("action"); conn = get_db()
+    if action == "suspend":
+        conn.execute("UPDATE users SET status='suspended' WHERE username=?", (username,))
+        add_log("WARN","ADMIN",f"Suspendu: {username}", session["admin_user"])
+    elif action == "ban":
+        conn.execute("UPDATE users SET status='banned' WHERE username=?", (username,))
+        add_log("WARN","ADMIN",f"Banni: {username}", session["admin_user"])
+    elif action == "reactivate":
+        conn.execute("UPDATE users SET status='active' WHERE username=?", (username,))
+        add_log("OK","ADMIN",f"Réactivé: {username}", session["admin_user"])
+    elif action == "reset_hwid":
+        conn.execute("UPDATE users SET hwid=NULL WHERE username=?", (username,))
+        add_log("OK","ADMIN",f"HWID reset: {username}", session["admin_user"])
+    elif action == "reset_password":
+        temp = _gen_temp_password()
+        conn.execute("UPDATE users SET password_hash=?,must_change_pass=1,temp_password=? WHERE username=?",
+                     (_hash_password(temp), temp, username))
+        conn.commit(); conn.close()
+        ur = get_db().execute("SELECT discord_id FROM users WHERE username=?", (username,)).fetchone()
+        if ur and ur["discord_id"]: _notify_discord(ur["discord_id"], f"🔑 MDP temporaire: `{temp}` — Change-le à la connexion!")
+        add_log("OK","ADMIN",f"MDP reset: {username} temp={temp}", session["admin_user"])
+        return redirect(f"/admin/user/{username}?msg=MDP+temp:+{temp}")
+    elif action == "upgrade_pro":
+        conn.execute("UPDATE users SET plan='PRO' WHERE username=?", (username,))
+        add_log("OK","ADMIN",f"Upgrade PRO: {username}", session["admin_user"])
+    elif action == "upgrade_lifetime":
+        conn.execute("UPDATE users SET plan='PRO' WHERE username=?", (username,))
+        add_log("OK","ADMIN",f"Upgrade PRO: {username}", session["admin_user"])
+    elif action == "downgrade_normal":
+        conn.execute("UPDATE users SET plan='NORMAL' WHERE username=?", (username,))
+        add_log("OK","ADMIN",f"Downgrade NORMAL: {username}", session["admin_user"])
+    conn.commit(); conn.close()
+    return redirect(f"/admin/user/{username}")
+
+@app.route("/admin/user/<username>/edit", methods=["POST"])
+@admin_required
+def admin_user_edit(username):
+    conn = get_db()
+    conn.execute("UPDATE users SET plan=?,note=?,discord_id=?,tags=? WHERE username=?",
+                 (request.form.get("plan","NORMAL"), request.form.get("note",""),
+                  request.form.get("discord_id",""), request.form.get("tags",""), username))
+    conn.commit(); conn.close()
+    add_log("OK","ADMIN",f"User {username} modifié", session["admin_user"])
+    return redirect(f"/admin/user/{username}?msg=Sauvegardé")
+
+@app.route("/admin/user/<username>/note", methods=["POST"])
+@admin_required
+def admin_add_note(username):
+    note = request.form.get("note","").strip()
+    color = request.form.get("color","gray")
+    if note:
+        conn = get_db()
+        conn.execute("INSERT INTO admin_notes (username,note,author,ts,color) VALUES (?,?,?,?,?)",
+                     (username, note, session["admin_user"], int(time.time()), color))
+        conn.commit(); conn.close()
+    return redirect(f"/admin/user/{username}#notes")
+
+@app.route("/admin/user/<username>/note/<int:nid>/delete", methods=["POST"])
+@admin_required
+def admin_delete_note(username, nid):
+    conn = get_db()
+    conn.execute("DELETE FROM admin_notes WHERE id=? AND username=?", (nid, username))
+    conn.commit(); conn.close()
+    return redirect(f"/admin/user/{username}#notes")
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN — REMOTE CONTROL PANEL
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin/remote")
+@admin_required
+def admin_remote():
+    conn = get_db()
+    sessions_db = conn.execute("SELECT * FROM remote_sessions ORDER BY started_at DESC LIMIT 50").fetchall()
+    conn.close()
+    active = {sid: s for sid, s in _remote_sessions.items() if s.get("status") in ("pending","active")}
+    return _page_remote(active, sessions_db, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/remote/<session_id>")
+@admin_required
+def admin_remote_viewer(session_id):
+    with _remote_lock:
+        sess = dict(_remote_sessions.get(session_id, {}))
+    if not sess:
+        return redirect("/admin/remote")
+    return _page_remote_viewer(session_id, sess, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/remote/<session_id>/connect", methods=["POST"])
+@admin_required
+def admin_remote_connect(session_id):
+    with _remote_lock:
+        if session_id in _remote_sessions:
+            _remote_sessions[session_id]["status"] = "active"
+            _remote_sessions[session_id]["admin_user"] = session["admin_user"]
+    conn = get_db()
+    conn.execute("UPDATE remote_sessions SET status='active',admin_user=? WHERE id=?",
+                 (session["admin_user"], session_id))
+    conn.commit(); conn.close()
+    uname = _remote_sessions.get(session_id,{}).get("username","?")
+    add_log("OK","REMOTE",f"Admin {session['admin_user']} connecté à {uname}", session["admin_user"])
+    _push_sse({"type":"remote_connected","session_id":session_id,"admin":session["admin_user"]})
+    return jsonify({"success": True})
+
+@app.route("/admin/remote/<session_id>/frame")
+@admin_required
+def admin_remote_frame(session_id):
+    """Retourne la dernière frame + métadonnées."""
+    with _remote_lock:
+        sess = _remote_sessions.get(session_id)
+        if not sess:
+            return jsonify({"frame": None, "status": "unknown"})
+        frame = sess["frames"][-1] if sess.get("frames") else None
+        frames_sent = sess.get("frames_sent", 0)
+        sess["frames_sent"] = frames_sent + (1 if frame else 0)
+    return jsonify({
+        "frame": frame,
+        "status": sess.get("status","unknown"),
+        "username": sess.get("username","?"),
+        "frames_recv": sess.get("frames_recv", 0),
+        "last_frame_ts": sess.get("last_frame_ts", 0),
+        "screen_w": sess.get("screen_w", 1920),
+        "screen_h": sess.get("screen_h", 1080),
+        "clipboard": sess.get("clipboard",""),
+        "chat": [m for m in sess.get("chat",[]) if m.get("from")=="user"][-5:],
+    })
+
+@app.route("/admin/remote/<session_id>/command", methods=["POST"])
+@admin_required
+def admin_remote_command(session_id):
+    """Envoie une ou plusieurs commandes au client."""
+    data = request.get_json(silent=True) or {}
+    cmd = data.get("cmd","")
+    with _remote_lock:
+        sess = _remote_sessions.get(session_id)
+        if sess and sess.get("status") == "active":
+            if "commands" not in sess: sess["commands"] = []
+            sess["commands"].append(cmd)
+    return jsonify({"success": True})
+
+@app.route("/admin/remote/<session_id>/quality", methods=["POST"])
+@admin_required
+def admin_remote_quality(session_id):
+    """Change la qualité JPEG et/ou l'intervalle entre frames."""
+    data = request.get_json(silent=True) or {}
+    quality  = int(data.get("quality", 50))
+    interval = int(data.get("interval", 80))
+    with _remote_lock:
+        sess = _remote_sessions.get(session_id)
+        if sess:
+            sess["frame_quality"]  = max(10, min(95, quality))
+            sess["frame_interval"] = max(30, min(500, interval))
+    return jsonify({"success": True})
+
+@app.route("/admin/remote/<session_id>/chat", methods=["POST"])
+@admin_required
+def admin_remote_chat(session_id):
+    """Envoie un message chat vers le client."""
+    data = request.get_json(silent=True) or {}
+    text = (data.get("text","") or "").strip()[:500]
+    if not text: return jsonify({"success": False})
+    with _remote_lock:
+        sess = _remote_sessions.get(session_id)
+        if not sess: return jsonify({"success": False})
+        if "chat" not in sess: sess["chat"] = []
+        sess["chat"].append({"from":"admin","text":text,"ts":int(time.time()),"delivered":False})
+    return jsonify({"success": True})
+
+@app.route("/admin/remote/<session_id>/disconnect", methods=["POST"])
+@admin_required
+def admin_remote_disconnect(session_id):
+    uname = _remote_sessions.get(session_id,{}).get("username","?")
+    with _remote_lock:
+        if session_id in _remote_sessions:
+            _remote_sessions[session_id]["status"] = "ended"
+            # Envoyer commande de fin au client
+            _remote_sessions[session_id].setdefault("commands",[]).append("SESSION_END")
+    conn = get_db()
+    conn.execute("UPDATE remote_sessions SET status='ended',ended_at=? WHERE id=?",
+                 (int(time.time()), session_id))
+    conn.commit(); conn.close()
+    add_log("WARN","REMOTE",f"Session {uname} déconnectée par {session['admin_user']}", session["admin_user"])
+    _push_sse({"type":"remote_ended","session_id":session_id})
+    return redirect("/admin/remote")
+
+@app.route("/admin/addons")
+@admin_required
+def admin_addons():
+    conn = get_db()
+    addon_keys = conn.execute("SELECT * FROM addon_licenses ORDER BY created_at DESC LIMIT 500").fetchall()
+    stats = {}
+    for addon in ["crosshair","fps_counter","vibrance","ram_cleaner","overclock","antilag",
+                  "process_boost","gpu_tuner","network_mon","temp_mon","input_lag","boot_speed"]:
+        stats[addon] = {
+            "active": conn.execute("SELECT COUNT(*) FROM addon_licenses WHERE addon_key=? AND status='active'", (addon,)).fetchone()[0],
+            "used":   conn.execute("SELECT COUNT(*) FROM addon_licenses WHERE addon_key=? AND status='used'",   (addon,)).fetchone()[0],
+        }
+    conn.close()
+    return _page_addons(addon_keys, stats, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/addons/revoke", methods=["POST"])
+@admin_required
+def admin_revoke_addon():
+    key = request.form.get("key","")
+    conn = get_db()
+    conn.execute("UPDATE addon_licenses SET status='revoked' WHERE key=?", (key,))
+    conn.commit(); conn.close()
+    add_log("WARN","ADDON",f"Clé addon révoquée: {key[:11]}…", session["admin_user"])
+    return redirect(request.referrer or "/admin/addons")
+
+@app.route("/admin/addons/generate", methods=["POST"])
+@admin_required
+def admin_addons_generate():
+    addon = request.form.get("addon_key","crosshair")
+    qty = min(int(request.form.get("qty",1)), 500)
+    note = request.form.get("note","")
+    conn = get_db(); generated = []
+    for _ in range(qty):
+        key = generate_addon_key(addon)
+        conn.execute("INSERT OR IGNORE INTO addon_licenses (key,addon_key,plan,status,created_at,note) VALUES (?,?,?,?,?,?)",
+                     (key, addon, "PRO", "active", int(time.time()), note))
+        generated.append(key)
+    conn.commit(); conn.close()
+    add_log("OK","ADDON_KEYS",f"{qty} clé(s) addon {addon}", session["admin_user"])
+    return _page_keys_result(generated, addon, "addon", session["admin_user"], session["admin_role"])
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN — KEYS / ADDON KEYS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin/keys")
+@admin_required
+def admin_keys():
+    conn = get_db()
+    keys = conn.execute("SELECT l.*,u.username FROM licenses l LEFT JOIN users u ON l.key=u.license_key ORDER BY l.created_at DESC LIMIT 200").fetchall()
+    addon_keys = conn.execute("SELECT * FROM addon_licenses ORDER BY created_at DESC LIMIT 100").fetchall()
+    conn.close()
+    return _page_keys(keys, addon_keys, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/keys/generate", methods=["POST"])
+@admin_required
+def admin_gen_keys():
+    plan = request.form.get("plan","NORMAL"); qty = min(int(request.form.get("qty",1)),500)
+    note = request.form.get("note",""); conn = get_db(); generated = []
+    for _ in range(qty):
+        key = generate_key(plan)
+        conn.execute("INSERT OR IGNORE INTO licenses (key,plan,status,created_at,note) VALUES (?,?,?,?,?)",
+                     (key, plan, "active", int(time.time()), note))
+        generated.append(key)
+    conn.commit(); conn.close()
+    add_log("OK","KEYS",f"{qty} clé(s) {plan}", session["admin_user"])
+    return _page_keys_result(generated, plan, "license", session["admin_user"], session["admin_role"])
+
+@app.route("/admin/keys/generate_addon", methods=["POST"])
+@admin_required
+def admin_gen_addon_keys():
+    addon = request.form.get("addon_key","crosshair")
+    qty = min(int(request.form.get("qty",1)),100)
+    note = request.form.get("note",""); conn = get_db(); generated = []
+    for _ in range(qty):
+        key = generate_addon_key(addon)
+        conn.execute("INSERT OR IGNORE INTO addon_licenses (key,addon_key,status,created_at,note) VALUES (?,?,?,?,?)",
+                     (key, addon, "active", int(time.time()), note))
+        generated.append(key)
+    conn.commit(); conn.close()
+    add_log("OK","ADDON_KEYS",f"{qty} clé(s) addon {addon}", session["admin_user"])
+    return _page_keys_result(generated, addon, "addon", session["admin_user"], session["admin_role"])
+
+@app.route("/admin/keys/revoke", methods=["POST"])
+@admin_required
+def admin_revoke_key():
+    key = request.form.get("key",""); conn = get_db()
+    conn.execute("UPDATE licenses SET status='revoked' WHERE key=?", (key,))
+    conn.commit(); conn.close()
+    add_log("WARN","KEYS",f"Révoquée: {key[:11]}…", session["admin_user"])
+    return redirect("/admin/keys")
+
+@app.route("/admin/keys/bulk_revoke", methods=["POST"])
+@admin_required
+def admin_bulk_revoke():
+    keys = [k.strip() for k in request.form.get("keys","").split("\n") if k.strip()]
+    conn = get_db()
+    for k in keys: conn.execute("UPDATE licenses SET status='revoked' WHERE key=?", (k,))
+    conn.commit(); conn.close()
+    add_log("WARN","KEYS",f"{len(keys)} clé(s) révoquées en masse", session["admin_user"])
+    return redirect("/admin/keys")
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN — MAINTENANCE / IPs / RESETS / TICKETS / LOGS / BROADCAST / OWNERS
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin/maintenance", methods=["GET","POST"])
+@admin_required
+def admin_maintenance():
+    if request.method == "POST":
+        target = request.form.get("target", "both")
+        state  = request.form.get("state", "0")
+        if target == "soft":
+            set_setting("maintenance_soft", state)
+            set_setting("maintenance", "0")
+        elif target == "site":
+            set_setting("maintenance_site", state)
+            set_setting("maintenance", "0")
+            # Sync vers site_settings pour que le site public en tienne compte
+            set_site_setting("site_maintenance", state)
+        else:  # both = API + site
+            set_setting("maintenance", state)
+            set_setting("maintenance_soft", state)
+            set_setting("maintenance_site", state)
+            set_site_setting("site_maintenance", state)
+        if request.form.get("msg_text",""):
+            msg_txt = request.form.get("msg_text")
+            set_setting("maintenance_msg", msg_txt)
+            set_site_setting("maintenance_site_msg", msg_txt)
+        if request.form.get("announce",""): set_setting("announce", request.form.get("announce",""))
+        if request.form.get("announce_color",""): set_setting("announce_color", request.form.get("announce_color","blue"))
+        add_log("OK","ADMIN",f"Maintenance {target}: {'ON' if state=='1' else 'OFF'}", session["admin_user"])
+        return redirect("/admin/maintenance")
+    maint_soft = get_setting("maintenance_soft") == "1"
+    maint_site = get_setting("maintenance_site") == "1"
+    maint_both = get_setting("maintenance") == "1"
+    return _page_maintenance(maint_both, maint_soft, maint_site,
+                             get_setting("maintenance_msg"),
+                             get_setting("announce"), get_setting("announce_color"),
+                             session["admin_user"], session["admin_role"])
+
+@app.route("/admin/ips")
+@admin_required
+def admin_ips():
+    conn = get_db(); rules = conn.execute("SELECT * FROM ip_rules ORDER BY added_at DESC").fetchall(); conn.close()
+    return _page_ips(rules, get_setting("vpn_block")=="1", request.args.get("prefill",""),
+                     session["admin_user"], session["admin_role"])
+
+@app.route("/admin/ips/add", methods=["POST"])
+@admin_required
+def admin_add_ip():
+    ip = request.form.get("ip","").strip(); rule = request.form.get("rule","blacklist"); note = request.form.get("note","")
+    if ip:
+        conn = get_db(); conn.execute("INSERT OR REPLACE INTO ip_rules VALUES (?,?,?,?)", (ip,rule,note,int(time.time()))); conn.commit(); conn.close()
+        add_log("OK","IP",f"IP {rule}: {ip}", session["admin_user"])
+    return redirect("/admin/ips")
+
+@app.route("/admin/ips/delete", methods=["POST"])
+@admin_required
+def admin_del_ip():
+    ip = request.form.get("ip",""); conn = get_db()
+    conn.execute("DELETE FROM ip_rules WHERE ip=?", (ip,)); conn.commit(); conn.close()
+    return redirect("/admin/ips")
+
+@app.route("/admin/ips/vpn", methods=["POST"])
+@admin_required
+def admin_toggle_vpn():
+    set_setting("vpn_block", "0" if get_setting("vpn_block")=="1" else "1")
+    return redirect("/admin/ips")
+
+@app.route("/admin/resets")
+@admin_required
+def admin_resets():
+    conn = get_db(); rows = conn.execute("SELECT * FROM reset_requests ORDER BY requested_at DESC LIMIT 100").fetchall(); conn.close()
+    return _page_resets(rows, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/resets/<int:rid>/approve", methods=["POST"])
+@admin_required
+def admin_approve_reset(rid):
+    conn = get_db(); req = conn.execute("SELECT * FROM reset_requests WHERE id=?", (rid,)).fetchone()
+    if not req or req["status"] != "pending": conn.close(); return redirect("/admin/resets")
+    if req["type"] == "password":
+        temp = _gen_temp_password()
+        conn.execute("UPDATE users SET password_hash=?,must_change_pass=1,temp_password=? WHERE username=?",
+                     (_hash_password(temp), temp, req["username"]))
+        conn.execute("UPDATE reset_requests SET status='approved',temp_pass=?,resolved_at=? WHERE id=?", (temp,int(time.time()),rid))
+        if req["discord_id"]: _notify_discord(req["discord_id"], f"✅ MDP temp: `{temp}` — Change-le à la connexion!")
+    elif req["type"] == "username":
+        if req["discord_id"]: _notify_discord(req["discord_id"], f"✅ Ton username: `{req['username']}`")
+        conn.execute("UPDATE reset_requests SET status='approved',resolved_at=? WHERE id=?", (int(time.time()),rid))
+    conn.commit(); conn.close()
+    return redirect("/admin/resets")
+
+@app.route("/admin/resets/<int:rid>/deny", methods=["POST"])
+@admin_required
+def admin_deny_reset(rid):
+    conn = get_db(); req = conn.execute("SELECT * FROM reset_requests WHERE id=?", (rid,)).fetchone()
+    if req and req["discord_id"]: _notify_discord(req["discord_id"], "❌ Ta demande de reset a été refusée.")
+    conn.execute("UPDATE reset_requests SET status='denied',resolved_at=? WHERE id=?", (int(time.time()),rid))
+    conn.commit(); conn.close(); return redirect("/admin/resets")
+
+@app.route("/admin/tickets")
+@admin_required
+def admin_tickets():
+    prio_f = request.args.get("priority","")
+    conn = get_db()
+    sql = "SELECT * FROM tickets WHERE 1=1"
+    params = []
+    if prio_f: sql += " AND priority=?"; params.append(prio_f)
+    sql += " ORDER BY created_at DESC LIMIT 100"
+    rows = conn.execute(sql, params).fetchall(); conn.close()
+    return _page_tickets(rows, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/tickets/<int:tid>/reply", methods=["POST"])
+@admin_required
+def admin_ticket_reply(tid):
+    response = request.form.get("response","").strip()
+    close = request.form.get("close","0")
+    conn = get_db()
+    ticket = conn.execute("SELECT * FROM tickets WHERE id=?", (tid,)).fetchone()
+    new_status = "closed" if close=="1" else "answered"
+    conn.execute("UPDATE tickets SET response=?,status=?,updated_at=? WHERE id=?",
+                 (response, new_status, int(time.time()), tid))
+    conn.commit()
+    if ticket:
+        if ticket["discord_id"]:
+            _notify_discord(ticket["discord_id"], f"📩 Réponse à ton ticket #{tid} ({ticket['subject'][:40]}):\n{response[:300]}")
+        add_log("OK","TICKET",f"Ticket #{tid} répondu ({new_status}): {ticket['user']}", session["admin_user"])
+        _push_sse({"type":"ticket_replied","tid":tid,"user":ticket["user"],"status":new_status})
+    conn.close()
+    ref = request.referrer or "/admin/tickets"
+    return redirect(ref if "admin" in ref else "/admin/tickets")
+
+@app.route("/admin/logs")
+@admin_required
+def admin_logs():
+    ft = request.args.get("type",""); conn = get_db()
+    rows = conn.execute("SELECT * FROM logs WHERE type=? ORDER BY ts DESC LIMIT 500" if ft else "SELECT * FROM logs ORDER BY ts DESC LIMIT 500",
+                        (ft,) if ft else ()).fetchall()
+    conn.close()
+    return _page_logs(rows, ft, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/broadcast", methods=["GET","POST"])
+@admin_required
+def admin_broadcast():
+    msg_sent = ""
+    if request.method == "POST":
+        message = request.form.get("message","").strip(); target = request.form.get("target","all")
+        conn = get_db()
+        q = {"all":"SELECT discord_id FROM users WHERE status='active' AND discord_id IS NOT NULL AND discord_id!=''",
+             "pro":"SELECT discord_id FROM users WHERE plan='PRO' AND discord_id IS NOT NULL AND discord_id!=''",
+             "normal":"SELECT discord_id FROM users WHERE plan='NORMAL' AND status='active' AND discord_id IS NOT NULL AND discord_id!=''"}.get(target,"")
+        users_list = conn.execute(q).fetchall() if q else []; conn.close()
+        for u in users_list: _notify_discord(u["discord_id"], f"📢 **Annonce WinOptimizer**\n{message}")
+        msg_sent = f"✅ Envoyé à {len(users_list)} utilisateur(s)."
+        add_log("OK","BROADCAST",f"{target}: {message[:60]}", session["admin_user"])
+    return _page_broadcast(msg_sent, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/owners")
+@admin_required
+def admin_owners():
+    if session.get("admin_role") != "owner": return redirect("/admin")
+    conn = get_db(); rows = conn.execute("SELECT * FROM admins ORDER BY created_at").fetchall(); conn.close()
+    return _page_owners(rows, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/owners/create", methods=["POST"])
+@admin_required
+def admin_create_admin():
+    if session.get("admin_role") != "owner": return redirect("/admin")
+    u = request.form.get("username","").strip(); p = request.form.get("password","").strip(); r = request.form.get("role","staff")
+    if u and p:
+        conn = get_db()
+        try:
+            conn.execute("INSERT INTO admins (username,password_hash,role,created_at,created_by) VALUES (?,?,?,?,?)",
+                         (u, _hash_password(p), r, int(time.time()), session["admin_user"]))
+            conn.commit()
+        except: pass
+        conn.close()
+    return redirect("/admin/owners")
+
+@app.route("/admin/owners/delete", methods=["POST"])
+@admin_required
+def admin_delete_admin():
+    if session.get("admin_role") != "owner": return redirect("/admin")
+    u = request.form.get("username","")
+    if u != "xywez":
+        conn = get_db(); conn.execute("DELETE FROM admins WHERE username=?", (u,)); conn.commit(); conn.close()
+    return redirect("/admin/owners")
+
+@app.route("/admin/profile", methods=["GET","POST"])
+@admin_required
+def admin_profile():
+    msg = ""
+    if request.method == "POST":
+        old = request.form.get("old_password",""); new = request.form.get("new_password","")
+        conn = get_db(); row = conn.execute("SELECT * FROM admins WHERE username=?", (session["admin_user"],)).fetchone()
+        if row and _hash_password(old) == row["password_hash"]:
+            conn.execute("UPDATE admins SET password_hash=? WHERE username=?", (_hash_password(new), session["admin_user"]))
+            conn.commit(); msg = "✅ MDP changé"
+        else: msg = "❌ Ancien MDP incorrect"
+        conn.close()
+    return _page_profile(msg, session["admin_user"], session["admin_role"])
+
+@app.route("/admin/anti-leak")
+@admin_required
+def admin_anti_leak():
+    conn = get_db()
+    alerts = conn.execute("SELECT * FROM hwid_alerts ORDER BY ts DESC LIMIT 100").fetchall()
+    conn.close()
+    return _page_anti_leak(alerts, session["admin_user"], session["admin_role"])
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  ADMIN — API JSON
+# ════════════════════════════════════════════════════════════════════════════════
+
+@app.route("/admin/api/user_addons")
+@admin_required
+def admin_api_user_addons():
+    username = request.args.get("username","").lower()
+    if not username:
+        return jsonify({"addons":[]})
+    conn = get_db()
+    rows = conn.execute("SELECT addon_key, source FROM user_addons WHERE username=?", (username,)).fetchall()
+    user = conn.execute("SELECT plan FROM users WHERE username=?", (username,)).fetchone()
+    conn.close()
+    addons = [{"key": r["addon_key"], "source": r["source"]} for r in rows]
+    if user and user["plan"] == "PRO":
+        PRO_FREE = ["fps_counter","vibrance","ram_cleaner","overclock","antilag","process_boost"]
+        have = {a["key"] for a in addons}
+        for a in PRO_FREE:
+            if a not in have:
+                addons.append({"key": a, "source": "pro_free_auto"})
+    return jsonify({"addons": addons, "plan": user["plan"] if user else "NORMAL"})
+
+@app.route("/admin/api/stats")
+@admin_required
+def admin_api_stats():
+    conn = get_db()
+    today = int(time.time()) - 86400
+    hourly = []
+    for i in range(24):
+        ts = int(time.time())-(i+1)*3600; te = int(time.time())-i*3600
+        hourly.append(conn.execute("SELECT COUNT(*) FROM users WHERE last_login>? AND last_login<?", (ts,te)).fetchone()[0])
+    hourly.reverse()
+    d = {
+        "total":          conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "active":         conn.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0],
+        "banned":         conn.execute("SELECT COUNT(*) FROM users WHERE status='banned'").fetchone()[0],
+        "pro":            conn.execute("SELECT COUNT(*) FROM users WHERE plan='PRO'").fetchone()[0],
+        "today_logins":   conn.execute("SELECT COUNT(*) FROM users WHERE last_login>?", (today,)).fetchone()[0],
+        "total_keys":     conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0],
+        "pending_resets": conn.execute("SELECT COUNT(*) FROM reset_requests WHERE status='pending'").fetchone()[0],
+        "open_tickets":   conn.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0],
+        "hwid_alerts":    conn.execute("SELECT COUNT(*) FROM hwid_alerts WHERE ts>?", (today,)).fetchone()[0],
+        "remote_active":  len([s for s in _remote_sessions.values() if s.get("status")=="active"]),
+        "remote_pending": len([s for s in _remote_sessions.values() if s.get("status")=="pending"]),
+        "hourly":         hourly,
+        "maintenance":    get_setting("maintenance") == "1",
+        "ts":             int(time.time()),
+    }
+    conn.close(); return jsonify(d)
+
+@app.route("/admin/api/recent_users")
+@admin_required
+def admin_api_recent():
+    conn = get_db()
+    rows = conn.execute("SELECT username,plan,status,last_login,ip,connections,os_info,cpu_info,gpu_info FROM users ORDER BY last_login DESC LIMIT 10").fetchall()
+    conn.close(); return jsonify([dict(r) for r in rows])
+
+@app.route("/admin/api/geoip")
+@admin_required
+def admin_api_geoip():
+    ip = request.args.get("ip","")
+    if not ip: return jsonify({"error": "IP manquante"})
+    return jsonify(get_geoip(ip))
+
+@app.route("/admin/api/remote_sessions")
+@admin_required
+def admin_api_remote_sessions():
+    sessions = []
+    with _remote_lock:
+        for sid, s in _remote_sessions.items():
+            if s.get("status") in ("pending","active"):
+                sessions.append({"id":sid,"username":s["username"],"ip":s.get("ip","?"),
+                                 "status":s["status"],"started_at":s["started_at"],
+                                 "has_frame":len(s.get("frames",[]))>0})
+    return jsonify(sessions)
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  API INTERNES BOT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _check_bot_token(data=None, args=None):
+    token = (data or {}).get("bot_token") or (args or {}).get("bot_token","")
+    return token == os.environ.get("BOT_TOKEN", "BOT_INTERNAL_TOKEN")
+
+@app.route("/api/internal/gen_key", methods=["POST"])
+def internal_gen_key():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    plan = data.get("plan","NORMAL"); qty = min(int(data.get("qty",1)),10)
+    conn = get_db(); keys = []
+    for _ in range(qty):
+        key = generate_key(plan)
+        conn.execute("INSERT OR IGNORE INTO licenses (key,plan,status,created_at,note) VALUES (?,?,?,?,?)",
+                     (key,plan,"active",int(time.time()),"Généré via bot"))
+        keys.append(key)
+    conn.commit(); conn.close()
+    return jsonify({"keys": keys})
+
+@app.route("/api/internal/approve_reset", methods=["POST"])
+def internal_approve_reset():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    req_id = data.get("req_id"); conn = get_db()
+    req = conn.execute("SELECT * FROM reset_requests WHERE id=?", (req_id,)).fetchone()
+    if not req: conn.close(); return jsonify({"error":"Not found"}), 404
+    if req["type"] == "password":
+        temp = _gen_temp_password()
+        conn.execute("UPDATE users SET password_hash=?,must_change_pass=1,temp_password=? WHERE username=?",
+                     (_hash_password(temp), temp, req["username"]))
+        conn.execute("UPDATE reset_requests SET status='approved',temp_pass=?,resolved_at=? WHERE id=?",
+                     (temp,int(time.time()),req_id))
+        conn.commit(); conn.close()
+        return jsonify({"success":True,"temp_pass":temp,"username":req["username"],"discord_id":req["discord_id"]})
+    conn.close(); return jsonify({"success":False})
+
+@app.route("/api/internal/pending_resets")
+def internal_pending_resets():
+    if not _check_bot_token(args=request.args): return jsonify({"error":"Non autorisé"}), 403
+    conn = get_db(); rows = conn.execute("SELECT * FROM reset_requests WHERE status='pending' ORDER BY requested_at").fetchall(); conn.close()
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/internal/stats")
+def internal_stats():
+    if not _check_bot_token(args=request.args): return jsonify({"error":"Non autorisé"}), 403
+    conn = get_db(); today = int(time.time()) - 86400
+    d = {
+        "total":         conn.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+        "active":        conn.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0],
+        "banned":        conn.execute("SELECT COUNT(*) FROM users WHERE status='banned'").fetchone()[0],
+        "pro":           conn.execute("SELECT COUNT(*) FROM users WHERE plan='PRO'").fetchone()[0],
+        "normal":        conn.execute("SELECT COUNT(*) FROM users WHERE plan='NORMAL'").fetchone()[0],
+        "today":         conn.execute("SELECT COUNT(*) FROM users WHERE last_login>?", (today,)).fetchone()[0],
+        "total_keys":    conn.execute("SELECT COUNT(*) FROM licenses").fetchone()[0],
+        "addon_active":  conn.execute("SELECT COUNT(*) FROM addon_licenses WHERE status='active'").fetchone()[0],
+        "pending_resets":conn.execute("SELECT COUNT(*) FROM reset_requests WHERE status='pending'").fetchone()[0],
+        "open_tickets":  conn.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0],
+        "hwid_alerts":   conn.execute("SELECT COUNT(*) FROM hwid_alerts WHERE ts>?", (today,)).fetchone()[0],
+        "maintenance":   get_setting("maintenance")=="1",
+    }
+    conn.close(); return jsonify(d)
+
+@app.route("/api/internal/user_info")
+def internal_user_info():
+    if not _check_bot_token(args=request.args): return jsonify({"error":"Non autorisé"}), 403
+    username = request.args.get("username","")
+    conn = get_db(); row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone(); conn.close()
+    if not row: return jsonify({"error":"Introuvable"}), 404
+    return jsonify({k: row[k] for k in row.keys() if k != "password_hash"})
+
+@app.route("/api/internal/user_action", methods=["POST"])
+def internal_user_action():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    username = data.get("username","").lower(); action = data.get("action","")
+    conn = get_db()
+    actions_map = {"ban":"banned","reactivate":"active","suspend":"suspended"}
+    if action in actions_map:
+        conn.execute("UPDATE users SET status=? WHERE username=?", (actions_map[action], username))
+        add_log("WARN" if action!="reactivate" else "OK","BOT",f"{action}: {username}")
+    elif action == "reset_hwid":
+        conn.execute("UPDATE users SET hwid='' WHERE username=?", (username,))
+    else:
+        conn.close(); return jsonify({"error":"Action inconnue"}), 400
+    conn.commit(); conn.close()
+    return jsonify({"success": True})
+
+@app.route("/api/internal/revoke_key", methods=["POST"])
+def internal_revoke_key():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    key = data.get("key","").upper()
+    conn = get_db(); conn.execute("UPDATE licenses SET status='revoked' WHERE key=?", (key,)); conn.commit(); conn.close()
+    return jsonify({"success": True})
+
+@app.route("/api/internal/broadcast", methods=["POST"])
+def internal_broadcast():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    message = data.get("message",""); target = data.get("target","all")
+    conn = get_db()
+    q = {
+        "all":    "SELECT discord_id FROM users WHERE status='active' AND discord_id IS NOT NULL AND discord_id!=''",
+        "pro":    "SELECT discord_id FROM users WHERE plan='PRO' AND status='active' AND discord_id IS NOT NULL AND discord_id!=''",
+        "normal": "SELECT discord_id FROM users WHERE plan='NORMAL' AND status='active' AND discord_id IS NOT NULL AND discord_id!=''"
+    }.get(target,"")
+    users_list = conn.execute(q).fetchall() if q else []; conn.close()
+    for u in users_list: _notify_discord(u["discord_id"], f"📢 **Annonce WinOptimizer**\n{message}")
+    return jsonify({"success": True, "count": len(users_list)})
+
+@app.route("/api/internal/set_maintenance", methods=["POST"])
+def internal_set_maintenance():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    state = data.get("state","0"); set_setting("maintenance", state)
+    return jsonify({"success": True, "maintenance": state=="1"})
+
+@app.route("/api/internal/gen_addon_key", methods=["POST"])
+def internal_gen_addon_key():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    addon = data.get("addon_key","").strip()
+    qty = min(int(data.get("qty",1)), 10)
+    if not addon: return jsonify({"error":"addon_key manquant"}), 400
+    conn = get_db(); keys = []
+    for _ in range(qty):
+        key = generate_addon_key(addon)
+        conn.execute("INSERT OR IGNORE INTO addon_licenses (key,addon_key,plan,status,created_at,note) VALUES (?,?,?,?,?,?)",
+                     (key, addon, "PRO", "active", int(time.time()), "Généré via bot Discord"))
+        keys.append(key)
+    conn.commit(); conn.close()
+    add_log("OK","ADDON_KEYS",f"{qty} clé(s) addon '{addon}' générées via bot")
+    return jsonify({"keys": keys})
+
+@app.route("/api/internal/addon_info")
+def internal_addon_info():
+    if not _check_bot_token(args=request.args): return jsonify({"error":"Non autorisé"}), 403
+    key = request.args.get("key","").upper().strip()
+    if not key: return jsonify({"error":"Clé manquante"}), 400
+    conn = get_db()
+    row = conn.execute("SELECT * FROM addon_licenses WHERE key=?", (key,)).fetchone()
+    conn.close()
+    if not row: return jsonify({"error":"Introuvable"}), 404
+    return jsonify(dict(row))
+
+@app.route("/api/internal/lookup_discord")
+def internal_lookup_discord():
+    if not _check_bot_token(args=request.args): return jsonify({"error":"Non autorisé"}), 403
+    discord_id = request.args.get("discord_id","").strip()
+    if not discord_id: return jsonify({"error":"discord_id manquant"}), 400
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT username,plan,status,connections,last_login,ip,discord_id FROM users WHERE discord_id=?",
+        (discord_id,)
+    ).fetchall()
+    conn.close()
+    if not rows: return jsonify({"error":"Introuvable"}), 404
+    return jsonify([dict(r) for r in rows])
+
+@app.route("/api/internal/upgrade_plan", methods=["POST"])
+def internal_upgrade_plan():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    username = data.get("username","").lower()
+    plan = data.get("plan","NORMAL").upper()
+    if plan not in ("NORMAL","PRO"):
+        return jsonify({"error":"Plan invalide — utilise NORMAL ou PRO"}), 400
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        conn.close(); return jsonify({"error":"Utilisateur introuvable"}), 404
+    conn.execute("UPDATE users SET plan=? WHERE username=?", (plan, username))
+    conn.commit(); conn.close()
+    add_log("OK","BOT",f"Plan mis à jour: {username} → {plan}")
+    return jsonify({"success": True, "plan": plan})
+
+@app.route("/api/internal/add_note", methods=["POST"])
+def internal_add_note():
+    data = request.get_json(silent=True) or {}
+    if not _check_bot_token(data): return jsonify({"error":"Non autorisé"}), 403
+    username = data.get("username","").lower()
+    note     = data.get("note","").strip()[:500]
+    color    = data.get("color","gray")
+    author   = data.get("author","Bot Discord")
+    if not username or not note: return jsonify({"error":"Paramètres manquants"}), 400
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+        conn.close(); return jsonify({"error":"Utilisateur introuvable"}), 404
+    conn.execute("INSERT INTO admin_notes (username,note,author,ts,color) VALUES (?,?,?,?,?)",
+                 (username, note, author, int(time.time()), color))
+    conn.commit(); conn.close()
+    add_log("OK","BOT",f"Note ajoutée à {username} par {author}")
+    return jsonify({"success": True})
+
+# ─── HELPER DISCORD DM ───────────────────────────────────────────────────────
+def _notify_discord(discord_id: str, message: str):
+    try:
+        payload = json.dumps({"user_id": discord_id, "message": message,
+                              "bot_token": os.environ.get("BOT_TOKEN","BOT_INTERNAL_TOKEN")}).encode()
+        req = urllib.request.Request(f"{DISCORD_BOT_URL}/dm", data=payload,
+                                     headers={"Content-Type":"application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=3)
+    except: pass
+
+def fmt_ts(ts):
+    if not ts: return "—"
+    try: return datetime.fromtimestamp(int(ts)).strftime("%d/%m/%Y %H:%M")
+    except: return "—"
+
+def fmt_ts_rel(ts):
+    if not ts: return "—"
+    try:
+        diff = int(time.time()) - int(ts)
+        if diff < 60: return f"il y a {diff}s"
+        if diff < 3600: return f"il y a {diff//60}m"
+        if diff < 86400: return f"il y a {diff//3600}h"
+        return f"il y a {diff//86400}j"
+    except: return "—"
+
+app.jinja_env.globals["fmt_ts"] = fmt_ts
+app.jinja_env.globals["fmt_ts_rel"] = fmt_ts_rel
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  DESIGN SYSTEM — CSS + JS
+# ════════════════════════════════════════════════════════════════════════════════
+
+_BASE_CSS = """
+:root{--bg:#07070d;--card:#0f0f1a;--card2:#161625;--card3:#1c1c2e;--border:#252538;
+  --green:#00ff88;--green2:#00cc6a;--blue:#4f8ef7;--red:#ff4466;--yellow:#ffcc00;
+  --purple:#a855f7;--cyan:#06b6d4;--orange:#f97316;
+  --text:#e8e8f4;--text2:#9898b8;--muted:#55556a;--sidebar:220px;
+  --glow:0 0 20px rgba(0,255,136,.15);}
+*{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;font-size:14px}
+a{color:var(--green);text-decoration:none}a:hover{opacity:.8}
+/* Scrollbar */
+::-webkit-scrollbar{width:5px;height:5px}::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:10px}
+/* Badge */
+.badge{display:inline-flex;align-items:center;gap:4px;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;white-space:nowrap}
+.b-green{background:rgba(0,255,136,.12);color:var(--green);border:1px solid rgba(0,255,136,.2)}
+.b-red{background:rgba(255,68,102,.12);color:var(--red);border:1px solid rgba(255,68,102,.2)}
+.b-yellow{background:rgba(255,204,0,.12);color:var(--yellow);border:1px solid rgba(255,204,0,.2)}
+.b-blue{background:rgba(79,142,247,.12);color:var(--blue);border:1px solid rgba(79,142,247,.2)}
+.b-purple{background:rgba(168,85,247,.12);color:var(--purple);border:1px solid rgba(168,85,247,.2)}
+.b-gray{background:rgba(100,100,136,.12);color:var(--text2);border:1px solid var(--border)}
+.b-cyan{background:rgba(6,182,212,.12);color:var(--cyan);border:1px solid rgba(6,182,212,.2)}
+.b-orange{background:rgba(249,115,22,.12);color:var(--orange);border:1px solid rgba(249,115,22,.2)}
+/* Layout */
+.layout{display:flex;min-height:100vh}
+/* Sidebar */
+.sidebar{width:var(--sidebar);background:rgba(10,10,20,.98);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;left:0;height:100vh;z-index:100;transition:transform .25s cubic-bezier(.4,0,.2,1);backdrop-filter:blur(20px)}
+.sidebar-logo{padding:18px 16px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.logo-icon{width:34px;height:34px;background:linear-gradient(135deg,var(--green),var(--cyan));border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:17px;color:#000;box-shadow:var(--glow);flex-shrink:0}
+.logo-txt span{font-weight:800;font-size:14px;color:var(--text);display:block}
+.logo-txt small{font-size:10px;color:var(--muted);font-weight:500}
+.sidebar nav{flex:1;overflow-y:auto;padding:8px 0}
+.nav-sec{padding:12px 14px 3px;font-size:10px;text-transform:uppercase;color:var(--muted);letter-spacing:1.2px;font-weight:700}
+.nav-item{display:flex;align-items:center;gap:9px;padding:9px 14px;color:var(--text2);font-size:13px;font-weight:500;transition:.12s;cursor:pointer;border-left:3px solid transparent;margin:1px 6px;border-radius:8px;position:relative}
+.nav-item:hover{color:var(--text);background:rgba(255,255,255,.05);text-decoration:none}
+.nav-item.active{color:var(--green);background:rgba(0,255,136,.07);border-left:3px solid var(--green)}
+.nav-item .ico{width:18px;text-align:center;font-size:15px;flex-shrink:0}
+.nav-item .cnt{margin-left:auto;background:var(--red);color:#fff;font-size:10px;padding:1px 6px;border-radius:10px;font-weight:700;min-width:18px;text-align:center}
+.nav-item .cnt.yellow{background:var(--yellow);color:#000}
+.nav-item .cnt.green{background:var(--green);color:#000}
+.sidebar-footer{padding:10px 14px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
+.sidebar-footer b{color:var(--text2)}
+/* Main */
+.main{margin-left:var(--sidebar);flex:1;display:flex;flex-direction:column;min-height:100vh}
+.topbar{background:rgba(10,10,20,.95);border-bottom:1px solid var(--border);padding:12px 22px;display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:50;backdrop-filter:blur(12px)}
+.topbar h1{font-size:16px;font-weight:700;flex:1;display:flex;align-items:center;gap:8px}
+.topbar .tbar-actions{display:flex;gap:8px;align-items:center}
+.menu-toggle{display:none;background:none;border:none;color:var(--text);font-size:22px;cursor:pointer;padding:4px;align-items:center;justify-content:center;line-height:1}
+.content{padding:20px 22px;flex:1}
+/* Notification bell */
+.notif-bell{position:relative;cursor:pointer;color:var(--text2);font-size:18px;padding:4px;border-radius:6px;transition:.15s}
+.notif-bell:hover{color:var(--text);background:var(--card2)}
+.notif-dot{position:absolute;top:2px;right:2px;width:8px;height:8px;background:var(--red);border-radius:50%;border:2px solid var(--bg)}
+.notif-panel{display:none;position:absolute;right:0;top:calc(100%+8px);width:320px;background:var(--card);border:1px solid var(--border);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5);z-index:200;max-height:400px;overflow-y:auto}
+.notif-panel.open{display:block}
+.notif-item{padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;display:flex;gap:8px;align-items:start}
+.notif-item:last-child{border-bottom:none}
+.notif-item .ico{font-size:16px;flex-shrink:0;margin-top:1px}
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:14px}
+.card-sm{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px}
+.card-title{font-weight:700;font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px;display:flex;align-items:center;gap:6px}
+.card-glow{border-color:rgba(0,255,136,.25);box-shadow:0 0 30px rgba(0,255,136,.06)}
+/* Stats grid */
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px;margin-bottom:18px}
+.stat-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;transition:.2s;cursor:default}
+.stat-card:hover{border-color:rgba(0,255,136,.3);transform:translateY(-1px);box-shadow:var(--glow)}
+.stat-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.stat-icon{font-size:20px;line-height:1}
+.stat-delta{font-size:10px;font-weight:700;padding:2px 6px;border-radius:6px}
+.stat-num{font-size:28px;font-weight:800;line-height:1.1}
+.stat-label{font-size:11px;color:var(--text2);margin-top:4px;font-weight:600}
+/* Table */
+.tbl-wrap{overflow-x:auto;border-radius:12px;border:1px solid var(--border)}
+table{width:100%;border-collapse:collapse}
+th{background:var(--card2);padding:10px 14px;font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;font-weight:700;text-align:left;white-space:nowrap}
+td{padding:10px 14px;border-top:1px solid var(--border);font-size:13px;vertical-align:middle}
+tr:hover td{background:rgba(255,255,255,.015)}
+/* Forms */
+.form-group{margin-bottom:12px}
+label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:5px}
+input,select,textarea{width:100%;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-size:13px;outline:none;transition:.15s;font-family:inherit}
+input:focus,select:focus,textarea:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(0,255,136,.08)}
+textarea{resize:vertical;min-height:80px}
+.input-row{display:grid;gap:10px}
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;border:none;cursor:pointer;transition:.15s;white-space:nowrap;font-family:inherit}
+.btn-green{background:linear-gradient(135deg,var(--green),var(--cyan));color:#000}
+.btn-green:hover{opacity:.9;transform:translateY(-1px)}
+.btn-red{background:var(--red);color:#fff}.btn-red:hover{background:#cc3355}
+.btn-blue{background:var(--blue);color:#fff}.btn-blue:hover{background:#3a7ae0}
+.btn-purple{background:var(--purple);color:#fff}.btn-purple:hover{opacity:.9}
+.btn-gray{background:var(--card2);color:var(--text);border:1px solid var(--border)}.btn-gray:hover{border-color:var(--green)}
+.btn-ghost{background:transparent;color:var(--text2);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text);border-color:var(--green)}
+.btn-sm{padding:5px 11px;font-size:11px;border-radius:6px}
+.btn-xs{padding:3px 8px;font-size:10px;border-radius:5px}
+.btn-icon{padding:6px;width:32px;height:32px;justify-content:center;border-radius:7px}
+/* Alert */
+.alert{padding:11px 14px;border-radius:10px;margin-bottom:14px;font-size:13px;font-weight:600}
+.alert-green{background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.25);color:var(--green)}
+.alert-red{background:rgba(255,68,102,.08);border:1px solid rgba(255,68,102,.25);color:var(--red)}
+.alert-yellow{background:rgba(255,204,0,.08);border:1px solid rgba(255,204,0,.25);color:var(--yellow)}
+.alert-blue{background:rgba(79,142,247,.08);border:1px solid rgba(79,142,247,.25);color:var(--blue)}
+/* Mini chart */
+.chart-bars{display:flex;align-items:flex-end;height:56px;gap:2px}
+.chart-bars .bar{flex:1;background:linear-gradient(to top,var(--green),var(--cyan));border-radius:2px 2px 0 0;opacity:.6;min-height:2px;transition:.3s;cursor:pointer}
+.chart-bars .bar:hover{opacity:1}
+/* Toggle */
+.toggle{position:relative;display:inline-block;width:46px;height:25px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-s{position:absolute;top:0;left:0;right:0;bottom:0;background:var(--border);border-radius:25px;transition:.3s;cursor:pointer}
+.toggle-s:before{content:'';position:absolute;width:18px;height:18px;left:3.5px;bottom:3.5px;background:#fff;border-radius:50%;transition:.3s}
+input:checked+.toggle-s{background:var(--green)}
+input:checked+.toggle-s:before{transform:translateX(21px)}
+/* Search bar */
+.search-wrap{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
+.search-wrap input,.search-wrap select{flex:1;min-width:140px;max-width:260px}
+/* Hardware grid */
+.hw-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px}
+.hw-item{background:var(--card2);border:1px solid var(--border);border-radius:9px;padding:10px 12px}
+.hw-label{font-size:10px;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:3px;display:flex;align-items:center;gap:4px}
+.hw-val{font-size:12px;color:var(--text);font-weight:600;word-break:break-word}
+/* Remote viewer */
+.remote-screen{width:100%;background:#000;border-radius:10px;border:2px solid var(--border);position:relative;overflow:hidden;cursor:crosshair;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}
+.remote-screen img{width:100%;height:100%;object-fit:contain;display:block}
+.remote-overlay{position:absolute;top:0;left:0;right:0;bottom:0}
+.remote-toolbar{display:flex;gap:8px;padding:10px;background:var(--card2);border-radius:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.remote-status-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--card2);border-radius:8px;font-size:12px;margin-bottom:10px}
+/* Session cards */
+.session-card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px;display:flex;gap:12px;align-items:center;transition:.2s}
+.session-card:hover{border-color:var(--green);box-shadow:var(--glow)}
+.session-avatar{width:40px;height:40px;background:linear-gradient(135deg,var(--green),var(--cyan));border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:800;color:#000;font-size:16px;flex-shrink:0}
+/* Notes */
+.note-card{padding:10px 12px;border-radius:8px;border-left:3px solid;margin-bottom:6px}
+.note-gray{background:var(--card2);border-left-color:var(--muted)}
+.note-red{background:rgba(255,68,102,.07);border-left-color:var(--red)}
+.note-yellow{background:rgba(255,204,0,.07);border-left-color:var(--yellow)}
+.note-green{background:rgba(0,255,136,.07);border-left-color:var(--green)}
+.note-blue{background:rgba(79,142,247,.07);border-left-color:var(--blue)}
+/* Login history */
+.login-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;margin-top:4px}
+/* Country map bars */
+.country-bar{display:flex;align-items:center;gap:8px;padding:5px 0}
+.country-prog{flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden}
+.country-fill{height:100%;background:linear-gradient(90deg,var(--green),var(--cyan));border-radius:3px}
+/* Announce banner */
+.announce-bar{padding:8px 16px;font-size:13px;font-weight:600;text-align:center;border-bottom:1px solid var(--border)}
+/* Tags */
+.tag{display:inline-block;padding:1px 8px;border-radius:12px;font-size:10px;font-weight:700;background:var(--card3);color:var(--text2);border:1px solid var(--border);margin:1px;cursor:pointer}
+.tag:hover{border-color:var(--green);color:var(--green)}
+/* ══ RESPONSIVE ADMIN ══ */
+@media(max-width:900px){
+  :root{--sidebar:0px}
+  .sidebar{transform:translateX(-220px);width:220px;z-index:150}
+  .sidebar.open{transform:translateX(0)}
+  .main{margin-left:0}
+  .menu-toggle{display:flex!important}
+  /* Grilles admin → 2 colonnes sur tablette */
+  .stats-grid{grid-template-columns:repeat(3,1fr)!important;gap:8px}
+}
+@media(max-width:768px){
+  :root{--sidebar:0px}
+  .sidebar{transform:translateX(-220px);width:220px}
+  .sidebar.open{transform:translateX(0)}
+  .main{margin-left:0}
+  .menu-toggle{display:flex!important}
+  .stats-grid{grid-template-columns:repeat(2,1fr)!important;gap:8px}
+  .content{padding:10px 8px}
+  .topbar{padding:8px 10px;gap:8px}
+  .topbar h1{font-size:13px}
+  td,th{padding:6px 8px;font-size:11px}
+  .hw-grid{grid-template-columns:1fr 1fr}
+  .input-row{grid-template-columns:1fr!important}
+  .card{padding:12px;border-radius:10px;margin-bottom:10px}
+  .card-sm{padding:10px}
+  .card-title{font-size:11px;margin-bottom:10px}
+  .btn{font-size:11px;padding:5px 10px}
+  .btn-sm{font-size:10px;padding:4px 8px}
+  .search-wrap{gap:6px}
+  .search-wrap input{min-width:100px}
+  .remote-toolbar{flex-direction:column;gap:4px;padding:8px}
+  .remote-toolbar > div{flex-wrap:wrap}
+  #remote-wrap{flex-direction:column!important}
+  #remote-right{width:100%!important;max-height:none!important;min-width:0!important}
+  #remote-left{width:100%!important}
+  .tbl-wrap{border-radius:8px;font-size:11px}
+  .notif-panel{width:260px;right:-8px}
+  .stat-num{font-size:20px}
+  .stat-label{font-size:10px}
+  .form-group{margin-bottom:8px}
+  /* Force single column pour les grilles inline */
+  div[style*="grid-template-columns:1fr 1fr"],
+  div[style*="grid-template-columns:2fr 1fr"],
+  div[style*="grid-template-columns:3fr 2fr"],
+  div[style*="grid-template-columns:1fr 1fr 1fr"],
+  div[style*="grid-template-columns:2fr 1fr 1fr"]{
+    grid-template-columns:1fr!important
+  }
+  .tbar-actions .badge{font-size:9px;padding:2px 6px}
+  .session-card{flex-wrap:wrap;gap:8px}
+  .session-card > a{width:100%;text-align:center}
+}
+@media(max-width:520px){
+  .stats-grid{grid-template-columns:repeat(2,1fr)!important;gap:6px}
+  .stat-card{padding:10px 12px}
+  .stat-num{font-size:18px}
+  .hw-grid{grid-template-columns:1fr!important}
+  .badge{font-size:9px;padding:2px 6px}
+  h1{font-size:13px!important}
+  .remote-toolbar .badge{display:none}
+  .topbar{padding:6px 8px}
+  .content{padding:8px 6px}
+  .card{padding:10px}
+  /* Masquer colonnes non-essentielles dans les tables */
+  .tbl-wrap table th:nth-child(n+5),
+  .tbl-wrap table td:nth-child(n+5){display:none}
+  .tbl-wrap .btn-ghost{padding:3px 7px;font-size:10px}
+  .nav-item{padding:7px 10px;font-size:12px}
+  .sidebar-footer{font-size:10px;padding:8px 10px}
+}
+.sidebar-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:90}
+.sidebar-overlay.show{display:block}
+/* Pulse animation */
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.pulse{animation:pulse 2s infinite}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn .3s ease}
+"""
+
+_BASE_JS = """
+// Sidebar toggle
+function toggleSidebar(){
+  var s=document.querySelector('.sidebar');
+  var o=document.querySelector('.sidebar-overlay');
+  if(s) s.classList.toggle('open');
+  if(o) o.classList.toggle('show');
+}
+document.addEventListener('DOMContentLoaded',function(){
+  var ov=document.querySelector('.sidebar-overlay');
+  if(ov) ov.addEventListener('click',function(){
+    document.querySelector('.sidebar').classList.remove('open');
+    ov.classList.remove('show');
+  });
+  // SSE connection
+  if(window.EventSource && document.body.dataset.admin){
+    var src = new EventSource('/admin/events');
+    src.onmessage = function(e){
+      try{
+        var d = JSON.parse(e.data);
+        handleSSE(d);
+      }catch(err){}
+    };
+  }
+  // Stats auto-refresh
+  if(document.getElementById('stat-total')){
+    setInterval(refreshStats, 20000);
+  }
+  // Remote session auto-check
+  if(document.getElementById('remote-sessions-list')){
+    setInterval(refreshRemoteSessions, 5000);
+  }
+});
+
+var _notifications = [];
+function handleSSE(d){
+  if(!d.type || d.type==='connected') return;
+  var dot = document.getElementById('notif-dot');
+  if(dot) dot.style.display='block';
+  var msg = '';
+  var ico = '📋';
+  if(d.type==='login'){ico='🟢';msg=`Connexion: <b>${d.username}</b> (${d.plan}) — ${d.ip||''}`;}
+  else if(d.type==='new_user'){ico='✨';msg=`Nouveau compte: <b>${d.username}</b> (${d.plan})`;}
+  else if(d.type==='new_ticket'){ico='📩';msg=`Nouveau ticket: <b>${d.user}</b> — ${d.subject}`;}
+  else if(d.type==='reset_request'){ico='🔄';msg=`Reset demandé: <b>${d.username}</b>`;}
+  else if(d.type==='support_request'){ico='🖥️';msg=`Support demandé: <b>${d.username}</b> — <a href="/admin/remote/${d.session_id}" class="btn btn-sm btn-green" style="padding:2px 8px">Rejoindre</a>`;}
+  else if(d.type==='alert'){ico='⚠️';msg=d.msg||'';}
+  else if(d.type==='remote_connected'){ico='🔗';msg=`Remote actif: session ${d.session_id.slice(0,8)}`;}
+  else return;
+  if(!msg) return;
+  _notifications.unshift({ico,msg,ts:new Date().toLocaleTimeString()});
+  renderNotifications();
+}
+
+function renderNotifications(){
+  var panel = document.getElementById('notif-list');
+  if(!panel) return;
+  panel.innerHTML = _notifications.slice(0,15).map(n=>
+    `<div class="notif-item fade-in"><span class="ico">${n.ico}</span><div><div style="font-size:11px;color:var(--text2)">${n.ts}</div><div>${n.msg}</div></div></div>`
+  ).join('') || '<div style="padding:16px;text-align:center;color:var(--muted);font-size:12px">Aucune notification</div>';
+}
+
+function toggleNotifPanel(){
+  var p = document.getElementById('notif-panel');
+  p.classList.toggle('open');
+  if(p.classList.contains('open')){
+    var dot=document.getElementById('notif-dot');if(dot)dot.style.display='none';
+  }
+}
+
+function refreshStats(){
+  fetch('/admin/api/stats').then(r=>r.json()).then(d=>{
+    var map = {
+      'stat-total':d.total,'stat-active':d.active,'stat-banned':d.banned,
+      'stat-pro':d.pro,'stat-today':d.today_logins,'stat-pending':d.pending_resets,
+      'stat-tickets':d.open_tickets,'stat-hwid':d.hwid_alerts,
+      'stat-remote':d.remote_active,'stat-remote-p':d.remote_pending
+    };
+    Object.entries(map).forEach(([id,val])=>{var e=document.getElementById(id);if(e)e.textContent=val;});
+    var bars=document.querySelectorAll('#hourly-chart .bar');
+    if(bars.length&&d.hourly){
+      var mx=Math.max(...d.hourly,1);
+      bars.forEach((b,i)=>{b.style.height=Math.max(3,(d.hourly[i]/mx)*52)+'px';b.title=d.hourly[i]+' conn';});
+    }
+  }).catch(()=>{});
+}
+
+function refreshRemoteSessions(){
+  fetch('/admin/api/remote_sessions').then(r=>r.json()).then(sessions=>{
+    var list = document.getElementById('remote-sessions-list');
+    if(!list) return;
+    if(!sessions.length){list.innerHTML='<div style="text-align:center;padding:24px;color:var(--muted);font-size:13px">Aucune session en attente</div>';return;}
+    list.innerHTML = sessions.map(s=>`
+      <div class="session-card fade-in">
+        <div class="session-avatar">${s.username[0].toUpperCase()}</div>
+        <div style="flex:1">
+          <div style="font-weight:700;font-size:14px">${s.username}</div>
+          <div style="color:var(--muted);font-size:11px">${s.ip} — ${s.has_frame?'Frame disponible':'En attente...'}</div>
+        </div>
+        <span class="badge ${s.status==='active'?'b-green':'b-yellow'}">${s.status==='active'?'🟢 Actif':'🟡 En attente'}</span>
+        <a href="/admin/remote/${s.id}" class="btn btn-green btn-sm">🖥 Voir</a>
+      </div>
+    `).join('');
+  }).catch(()=>{});
+}
+
+// Clipboard
+function copyText(txt){navigator.clipboard.writeText(txt).then(()=>{showToast('Copié !')}).catch(()=>{});}
+function showToast(msg,type='green'){
+  var t=document.createElement('div');
+  t.style.cssText=`position:fixed;bottom:20px;right:20px;background:var(--card);border:1px solid var(--${type});color:var(--${type});padding:10px 16px;border-radius:10px;font-size:13px;font-weight:600;z-index:9999;box-shadow:0 8px 24px rgba(0,0,0,.4);animation:fadeIn .3s ease`;
+  t.textContent=msg;document.body.appendChild(t);setTimeout(()=>t.remove(),2500);
+}
+
+// Remote viewer
+var _remoteInterval = null;
+function startRemoteViewer(sessionId){
+  var img = document.getElementById('remote-img');
+  var status = document.getElementById('remote-frame-status');
+  if(!img) return;
+  _remoteInterval = setInterval(function(){
+    fetch('/admin/remote/'+sessionId+'/frame')
+      .then(r=>r.json())
+      .then(d=>{
+        if(d.frame){
+          img.src='data:image/jpeg;base64,'+d.frame;
+          img.style.display='block';
+          var ph=document.getElementById('remote-placeholder');if(ph)ph.style.display='none';
+          if(status)status.textContent='Live';
+        }
+        if(d.status==='ended'){
+          clearInterval(_remoteInterval);
+          if(status)status.textContent='Session terminée';
+          showToast('Session terminée','yellow');
+        }
+      }).catch(()=>{});
+  }, 150);
+}
+function stopRemoteViewer(){if(_remoteInterval)clearInterval(_remoteInterval);}
+
+function sendRemoteCmd(sessionId, cmd){
+  fetch('/admin/remote/'+sessionId+'/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd})});
+}
+
+function setupRemoteInput(sessionId){
+  var overlay = document.getElementById('remote-overlay');
+  var img = document.getElementById('remote-img');
+  if(!overlay||!img) return;
+  // Mouse move avec throttle 40ms pour réduire la latence
+  var _mvThrottle=0;
+  overlay.addEventListener('mousemove',function(e){
+    var now=Date.now();
+    if(now-_mvThrottle<40) return;
+    _mvThrottle=now;
+    var r=overlay.getBoundingClientRect();
+    var x=Math.round((e.clientX-r.left)/r.width*100);
+    var y=Math.round((e.clientY-r.top)/r.height*100);
+    sendRemoteCmd(sessionId,'MOVE:'+x+':'+y);
+  });
+  // Click
+  overlay.addEventListener('click',function(e){
+    var r=overlay.getBoundingClientRect();
+    var x=Math.round((e.clientX-r.left)/r.width*100);
+    var y=Math.round((e.clientY-r.top)/r.height*100);
+    sendRemoteCmd(sessionId,'CLICK:'+x+':'+y);
+  });
+  // Right click
+  overlay.addEventListener('contextmenu',function(e){
+    e.preventDefault();
+    var r=overlay.getBoundingClientRect();
+    var x=Math.round((e.clientX-r.left)/r.width*100);
+    var y=Math.round((e.clientY-r.top)/r.height*100);
+    sendRemoteCmd(sessionId,'RCLICK:'+x+':'+y);
+  });
+  // Keyboard
+  document.addEventListener('keydown',function(e){
+    if(document.activeElement.tagName!=='INPUT'&&document.activeElement.tagName!=='TEXTAREA'){
+      sendRemoteCmd(sessionId,'KEY:'+e.key);
+    }
+  });
+}
+"""
+
+# ─── NAV BUILDER ─────────────────────────────────────────────────────────────
+def _get_counts():
+    try:
+        conn = get_db()
+        pr = int(conn.execute("SELECT COUNT(*) FROM reset_requests WHERE status='pending'").fetchone()[0])
+        ot = int(conn.execute("SELECT COUNT(*) FROM tickets WHERE status='open'").fetchone()[0])
+        ha = int(conn.execute("SELECT COUNT(*) FROM hwid_alerts WHERE ts>?", (int(time.time())-86400,)).fetchone()[0])
+        conn.close()
+    except: pr=ot=ha=0
+    rem_pending = len([s for s in _remote_sessions.values() if s.get("status")=="pending"])
+    return pr, ot, ha, rem_pending
+
+def _nav(active):
+    pr, ot, ha, rp = _get_counts()
+    items = [
+        ("sec1",None,"PRINCIPAL",None),
+        ("/admin","📊","Dashboard",""),
+        ("/admin/users","👤","Utilisateurs",""),
+        ("/admin/remote","🖥️","Remote Control", str(rp) if rp else ""),
+        ("sec2",None,"GESTION",None),
+        ("/admin/keys","🔑","Licences",""),
+        ("/admin/addons","🎮","Addons",""),
+        ("/admin/resets","🔄","Resets", str(pr) if pr else ""),
+        ("/admin/tickets","📩","Tickets", str(ot) if ot else ""),
+        ("/admin/anti-leak","🛡","Anti-Crack/Leak", str(ha) if ha else ""),
+        ("sec3",None,"SYSTÈME",None),
+        ("/admin/site","🌐","Site Web",""),
+        ("/admin/update","🔄","Mise à jour",""),
+        ("/admin/logs","📋","Logs",""),
+        ("/admin/ips","🌐","IPs / Whitelist",""),
+        ("/admin/maintenance","⚙️","Maintenance",""),
+        ("/admin/broadcast","📢","Broadcast",""),
+        ("sec4",None,"ADMIN",None),
+        ("/admin/owners","👑","Équipe",""),
+        ("/admin/profile","🔐","Mon compte",""),
+    ]
+    html = ""
+    for item in items:
+        if item[1] is None:
+            html += f'<div class="nav-sec">{item[2]}</div>'
+            continue
+        href, ico, label, cnt = item
+        cls = "active" if active == href else ""
+        badge = f'<span class="cnt {"yellow" if cnt and int(cnt)>0 and href not in ["/admin/remote"] else "green" if href=="/admin/remote" else ""}">{cnt}</span>' if cnt else ""
+        html += f'<a href="{href}" class="nav-item {cls}"><span class="ico">{ico}</span>{label}{badge}</a>'
+    return html
+
+def _layout(title, active, content, admin_user="", admin_role=""):
+    maint = get_setting("maintenance") == "1"
+    announce = get_setting("announce")
+    announce_color = get_setting("announce_color", "blue")
+    color_map = {"green":"var(--green)","blue":"var(--blue)","red":"var(--red)","yellow":"var(--yellow)","purple":"var(--purple)"}
+    ann_col = color_map.get(announce_color,"var(--blue)")
+    announce_html = f'<div class="announce-bar" style="background:{ann_col}22;color:{ann_col}">{announce}</div>' if announce else ""
+    return f"""<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — WinOptimizer v{APP_VERSION}</title>
+<style>{_BASE_CSS}</style></head>
+<body data-admin="{admin_user}">
+<div class="sidebar-overlay"></div>
+<div class="layout">
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-icon">⚡</div>
+    <div class="logo-txt"><span>WinOptimizer</span><small>Admin Panel v{APP_VERSION}</small></div>
+  </div>
+  <nav>{_nav(active)}</nav>
+  <div class="sidebar-footer">
+    <b>{admin_user}</b> — {admin_role}<br>
+    <a href="/admin/logout" style="color:var(--red);font-size:11px">🚪 Déconnexion</a>
+  </div>
+</aside>
+<div class="main">
+  {announce_html}
+  <div class="topbar">
+    <button class="menu-toggle" onclick="toggleSidebar()" aria-label="Menu">☰</button>
+    <h1>{title}</h1>
+    <div class="tbar-actions">
+      <span class="badge {'b-red pulse' if maint else 'b-green'}">{'🔴 MAINTENANCE' if maint else '🟢 EN LIGNE'}</span>
+      <div style="position:relative">
+        <div class="notif-bell" onclick="toggleNotifPanel()">🔔<span id="notif-dot" class="notif-dot" style="display:none"></span></div>
+        <div id="notif-panel" class="notif-panel">
+          <div style="padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text2)">NOTIFICATIONS</div>
+          <div id="notif-list"><div style="padding:16px;text-align:center;color:var(--muted);font-size:12px">Aucune notification</div></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="content">{content}</div>
+</div>
+</div>
+<script>{_BASE_JS}</script>
+</body></html>"""
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  PAGE BUILDERS
+# ════════════════════════════════════════════════════════════════════════════════
+
+LOGIN_HTML = """<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin Login — WinOptimizer</title>
+<style>
+:root{--bg:#07070d;--card:#0f0f1a;--card2:#161625;--border:#252538;--green:#00ff88;--cyan:#06b6d4;--text:#e8e8f4;--text2:#9898b8;--muted:#55556a;--red:#ff4466;}
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);display:flex;align-items:center;justify-content:center;min-height:100vh;background:radial-gradient(ellipse at 30% 20%,#0a1020,var(--bg) 60%)}
+.box{width:100%;max-width:400px;padding:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:36px 30px}
+.logo{text-align:center;margin-bottom:28px}
+.logo-icon{width:58px;height:58px;background:linear-gradient(135deg,#00ff88,#06b6d4);border-radius:16px;display:inline-flex;align-items:center;justify-content:center;font-size:28px;color:#000;margin-bottom:12px;box-shadow:0 0 30px rgba(0,255,136,.2)}
+.logo h2{font-size:22px;font-weight:800}.logo p{color:var(--muted);font-size:13px;margin-top:4px}
+.alert{padding:11px;border-radius:8px;background:rgba(255,68,102,.1);border:1px solid rgba(255,68,102,.3);color:#ff4466;font-size:13px;margin-bottom:14px}
+.form-group{margin-bottom:12px}label{display:block;font-size:12px;font-weight:600;color:var(--text2);margin-bottom:5px}
+input{width:100%;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:var(--text);font-size:14px;outline:none;transition:.15s}
+input:focus{border-color:var(--green);box-shadow:0 0 0 3px rgba(0,255,136,.08)}
+.btn{width:100%;padding:12px;border-radius:9px;background:linear-gradient(135deg,var(--green),var(--cyan));color:#000;font-size:14px;font-weight:700;border:none;cursor:pointer;margin-top:6px;font-family:inherit;transition:.15s}
+.btn:hover{opacity:.9;transform:translateY(-1px)}
+</style></head><body>
+<div class="box"><div class="card">
+  <div class="logo"><div class="logo-icon">⚡</div><h2>WinOptimizer</h2><p>Panel d'administration v"""+APP_VERSION+"""</p></div>
+  {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <div class="form-group"><label>Identifiant</label><input name="username" placeholder="admin" autofocus></div>
+    <div class="form-group"><label>Mot de passe</label><input name="password" type="password" placeholder="••••••••"></div>
+    <button type="submit" class="btn">Se connecter →</button>
+  </form>
+</div></div></body></html>"""
+
+
+def _page_dashboard(stats, recent_users, recent_logs, top_ips, admin_user, admin_role):
+    max_h = max(stats["hourly"] + [1])
+    bars = "".join(f'<div class="bar" style="height:{max(3,int(v/max_h*52))}px" title="{v} conn"></div>' for v in stats["hourly"])
+
+    rec_rows = ""
+    for u in recent_users:
+        if u["plan"]=="PRO": pb='<span class="badge b-blue">⭐ PRO</span>'
+        else: pb='<span class="badge b-gray">🔷 NORMAL</span>'
+        if u["status"]=="active": sb='<span class="badge b-green">actif</span>'
+        elif u["status"]=="banned": sb='<span class="badge b-red">banni</span>'
+        else: sb=f'<span class="badge b-yellow">{u["status"]}</span>'
+        rec_rows += f"<tr><td><a href='/admin/user/{u['username']}'><b>{u['username']}</b></a></td><td>{pb}</td><td>{sb}</td><td style='font-size:11px;color:var(--text2)'>{u['gpu_info'] or '—'}</td><td style='color:var(--text2)'>{u['connections'] or 0}</td><td style='font-size:11px;color:var(--text2)'>{fmt_ts_rel(u['last_login'])}</td></tr>"
+
+    log_rows = ""
+    for l in recent_logs:
+        lc = "b-green" if l["level"]=="OK" else "b-red" if l["level"]=="ERROR" else "b-yellow"
+        log_rows += f'<tr><td><span class="badge {lc}">{l["level"]}</span></td><td style="font-size:11px;color:var(--text2)">{l["type"]}</td><td style="font-size:12px">{l["msg"][:60]}</td><td style="font-size:11px;color:var(--muted)">{fmt_ts_rel(l["ts"])}</td></tr>'
+
+    remote_stat_col = "b-green" if stats["remote_active"] > 0 else "b-gray"
+
+    content = f"""
+<div class="stats-grid">
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">👥</div></div><div class="stat-num" id="stat-total" style="color:var(--text)">{stats['total']}</div><div class="stat-label">Utilisateurs total</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">✅</div></div><div class="stat-num" id="stat-active" style="color:var(--green)">{stats['active']}</div><div class="stat-label">Actifs</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">⭐</div></div><div class="stat-num" id="stat-pro" style="color:var(--blue)">{stats['pro']}</div><div class="stat-label">Plan PRO</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">🔷</div></div><div class="stat-num" id="stat-normal" style="color:var(--cyan)">{stats['normal']}</div><div class="stat-label">Plan NORMAL</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">📅</div></div><div class="stat-num" id="stat-today" style="color:var(--cyan)">{stats['today_logins']}</div><div class="stat-label">Logins aujourd'hui</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">🔑</div></div><div class="stat-num" id="stat-keys" style="color:var(--text)">{stats['total_lic']}</div><div class="stat-label">Licences total</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">🔄</div></div><div class="stat-num" id="stat-pending" style="color:var(--yellow)">{stats['pending_reset']}</div><div class="stat-label">Resets en attente</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">📩</div></div><div class="stat-num" id="stat-tickets" style="color:var(--orange)">{stats['open_tickets']}</div><div class="stat-label">Tickets ouverts</div></div>
+  <div class="stat-card"><div class="stat-top"><div class="stat-icon">🛡</div></div><div class="stat-num" id="stat-hwid" style="color:var(--red)">{stats['hwid_alerts']}</div><div class="stat-label">Alertes anti-leak</div></div>
+  <div class="stat-card card-glow"><div class="stat-top"><div class="stat-icon">🖥️</div><span class="badge {remote_stat_col}" id="stat-remote-badge">{stats['remote_active']} actif</span></div><div class="stat-num" id="stat-remote" style="color:var(--purple)">{stats['remote_active']}</div><div class="stat-label">Remote sessions <span id="stat-remote-p" style="color:var(--yellow);font-size:11px">{f"· {stats['remote_pending']} en attente" if stats['remote_pending'] else ""}</span></div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:14px">
+<div class="card">
+  <div class="card-title">📈 Activité 24h (par heure)</div>
+  <div id="hourly-chart" class="chart-bars" style="margin-bottom:4px">{bars}</div>
+  <div style="display:flex;justify-content:space-between;color:var(--muted);font-size:10px"><span>-24h</span><span>maintenant</span></div>
+</div>
+<div class="card">
+  <div class="card-title">🌍 Top IPs</div>
+  {''.join(f'<div class="country-bar"><span style="font-size:11px;color:var(--text2);width:110px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{ip["ip"]}</span><div class="country-prog"><div class="country-fill" style="width:{min(100,ip["cnt"]*10)}%"></div></div><span style="font-size:11px;color:var(--text2);width:24px;text-align:right">{ip["cnt"]}</span></div>' for ip in top_ips) or '<div style="color:var(--muted);font-size:12px;text-align:center;padding:16px">Pas encore de données</div>'}
+</div>
+</div>
+
+<div style="display:grid;grid-template-columns:3fr 2fr;gap:14px">
+<div class="card">
+  <div class="card-title" style="display:flex;justify-content:space-between">
+    <span>👤 Connexions récentes</span>
+    <a href="/admin/users" style="font-size:11px;color:var(--green)">Voir tout →</a>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Username</th><th>Plan</th><th>Statut</th><th>GPU</th><th>Conn.</th><th>Quand</th></tr></thead>
+    <tbody>{rec_rows or '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:20px">Aucune donnée</td></tr>'}</tbody>
+  </table></div>
+</div>
+<div class="card">
+  <div class="card-title" style="display:flex;justify-content:space-between">
+    <span>📋 Logs récents</span>
+    <a href="/admin/logs" style="font-size:11px;color:var(--green)">Voir tout →</a>
+  </div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Niv.</th><th>Type</th><th>Message</th><th>Quand</th></tr></thead>
+    <tbody>{log_rows or '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:16px">Aucun log</td></tr>'}</tbody>
+  </table></div>
+</div>
+</div>
+"""
+    return _layout("Dashboard", "/admin", content, admin_user, admin_role)
+
+
+def _page_users(users, q, plan_f, status_f, admin_user, admin_role):
+    rows = ""
+    for u in users:
+        if u["plan"]=="PRO": pb='<span class="badge b-blue">⭐ PRO</span>'
+        else: pb='<span class="badge b-gray">🔷 NORMAL</span>'
+        if u["status"]=="active": sb='<span class="badge b-green">actif</span>'
+        elif u["status"]=="banned": sb='<span class="badge b-red">banni</span>'
+        else: sb=f'<span class="badge b-yellow">{u["status"]}</span>'
+        geo = get_geoip(u["ip"]) if u["ip"] else {}
+        flag = geo.get("flag","")
+        tags_html = " ".join(f'<span class="tag">{t.strip()}</span>' for t in (u["tags"] or "").split(",") if t.strip()) if u["tags"] else ""
+        rows += f"""<tr>
+          <td><a href="/admin/user/{u['username']}"><b>{u['username']}</b></a> {tags_html}</td>
+          <td>{pb}</td><td>{sb}</td>
+          <td style="font-size:11px;color:var(--text2)">{flag} {u['ip'] or '—'}</td>
+          <td style="font-size:11px;color:var(--text2);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{u['gpu_info'] or '—'}</td>
+          <td style="font-size:11px;color:var(--text2);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{u['cpu_info'] or '—'}</td>
+          <td style="color:var(--text2)">{u['connections'] or 0}</td>
+          <td style="font-size:11px;color:var(--text2)">{fmt_ts_rel(u['last_login'])}</td>
+          <td><a href="/admin/user/{u['username']}" class="btn btn-ghost btn-sm">→</a></td>
+        </tr>"""
+
+    content = f"""
+<div class="search-wrap">
+  <form method="GET" style="display:contents">
+    <input name="q" value="{q}" placeholder="🔍 Nom, IP, Discord, GPU, clé...">
+    <select name="plan" style="max-width:140px"><option value="">Tous plans</option><option {'selected' if plan_f=='PRO' else ''} value="PRO">⭐ PRO</option><option {'selected' if plan_f=='NORMAL' else ''} value="NORMAL">NORMAL</option></select>
+    <select name="status" style="max-width:140px"><option value="">Tous statuts</option><option {'selected' if status_f=='active' else ''} value="active">Actif</option><option {'selected' if status_f=='banned' else ''} value="banned">Banni</option><option {'selected' if status_f=='suspended' else ''} value="suspended">Suspendu</option></select>
+    <button type="submit" class="btn btn-green btn-sm">Filtrer</button>
+    <a href="/admin/users" class="btn btn-gray btn-sm">Reset</a>
+  </form>
+  <div style="margin-left:auto;color:var(--text2);font-size:12px">{len(users)} résultat(s)</div>
+</div>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Username</th><th>Plan</th><th>Statut</th><th>IP</th><th>GPU</th><th>CPU</th><th>Conn.</th><th>Dernier login</th><th></th></tr></thead>
+  <tbody>{rows or '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:30px">Aucun résultat</td></tr>'}</tbody>
+</table></div>
+"""
+    return _layout("Utilisateurs", "/admin/users", content, admin_user, admin_role)
+
+
+def _page_user_detail(user, logs, alerts, login_hist, notes, remote_hist, geo, msg, admin_user, admin_role):
+    hw_items = [
+        ("💻 OS", user["os_info"] or "—"),
+        ("🖥 CPU", user["cpu_info"] or "—"),
+        ("🎮 GPU", user["gpu_info"] or "—"),
+        ("💾 RAM", user["ram_info"] or "—"),
+        ("🔌 Carte mère", user["motherboard_info"] or "—"),
+        ("💿 Stockage", user["disk_info"] or "—"),
+    ]
+    hw_html = "".join(f'<div class="hw-item"><div class="hw-label">{l}</div><div class="hw-val">{v}</div></div>' for l,v in hw_items)
+
+    if user["status"]=="active": sb='<span class="badge b-green">actif</span>'
+    elif user["status"]=="banned": sb='<span class="badge b-red">banni</span>'
+    else: sb=f'<span class="badge b-yellow">{user["status"]}</span>'
+    if user["plan"]=="PRO": pb='<span class="badge b-blue">⭐ PRO</span>'
+    else: pb='<span class="badge b-gray">🔷 NORMAL</span>'
+
+    flag = geo.get("flag","🌐"); country = geo.get("country","?"); city = geo.get("city","?"); isp = geo.get("isp","?")
+    proxy_warn = '<span class="badge b-yellow">🕵 VPN/Proxy</span>' if geo.get("proxy") else ""
+
+    # Login history
+    hist_html = ""
+    for h in login_hist:
+        dot_color = "var(--green)" if h["success"] else "var(--red)"
+        hist_html += f"""<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+          <div class="login-dot" style="background:{dot_color}"></div>
+          <span style="font-size:12px">{h['flag'] or '🌐'} {h['ip']}</span>
+          <span style="font-size:11px;color:var(--text2)">{h['city']}, {h['country']}</span>
+          <span style="margin-left:auto;font-size:11px;color:var(--muted)">{fmt_ts_rel(h['ts'])}</span>
+          {'<span class="badge b-red">'+h['reason']+'</span>' if not h['success'] and h['reason'] else ''}
+        </div>"""
+
+    # Notes
+    notes_html = ""
+    for n in notes:
+        notes_html += f"""<div class="note-card note-{n['color']}">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="font-size:11px;color:var(--text2);font-weight:700">{n['author']} — {fmt_ts_rel(n['ts'])}</span>
+            <form method="POST" action="/admin/user/{user['username']}/note/{n['id']}/delete" style="display:inline">
+              <button class="btn btn-xs" style="background:transparent;color:var(--muted);border:none;cursor:pointer">✕</button>
+            </form>
+          </div>
+          <div style="font-size:13px">{n['note']}</div>
+        </div>"""
+
+    # Remote history
+    rem_html = ""
+    for r in remote_hist:
+        rem_html += f'<tr><td style="font-size:11px;color:var(--text2)">{fmt_ts(r["started_at"])}</td><td style="font-size:11px">{r["admin_user"] or "—"}</td><td><span class="badge {"b-green" if r["status"]=="ended" else "b-yellow"}">{r["status"]}</span></td><td style="font-size:11px;color:var(--text2)">{fmt_ts(r["ended_at"])}</td></tr>'
+
+    # Tags
+    tags = [t.strip() for t in (user["tags"] or "").split(",") if t.strip()]
+    tags_html = " ".join(f'<span class="tag">{t}</span>' for t in tags) if tags else '<span style="color:var(--muted);font-size:12px">Aucun tag</span>'
+
+    log_rows = "".join(f'<tr><td style="color:var(--muted);font-size:11px;white-space:nowrap">{fmt_ts(l["ts"])}</td><td><span class="badge {"b-green" if l["level"]=="OK" else "b-red"}">{l["level"]}</span></td><td style="font-size:11px;color:var(--text2)">{l["type"]}</td><td style="font-size:12px">{l["msg"]}</td></tr>' for l in logs)
+    alert_rows = "".join(f'<tr><td style="font-size:11px;color:var(--muted)">{fmt_ts(a["ts"])}</td><td style="font-size:11px;font-family:monospace">{(a["hwid"] or "")[:20]}…</td><td style="color:var(--red);font-size:12px">{a["note"]}</td></tr>' for a in alerts)
+
+    content = f"""
+{f'<div class="alert alert-green">{msg}</div>' if msg else ''}
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+
+<div class="card">
+  <div class="card-title">👤 Profil</div>
+  <div style="display:flex;align-items:center;gap:14px;margin-bottom:16px">
+    <div style="width:52px;height:52px;background:linear-gradient(135deg,var(--green),var(--cyan));border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#000;flex-shrink:0">{user['username'][0].upper()}</div>
+    <div>
+      <div style="font-size:18px;font-weight:800">{user['username']}</div>
+      <div style="display:flex;gap:6px;margin-top:4px">{pb} {sb}</div>
+    </div>
+  </div>
+  <div style="display:grid;gap:4px">
+    {''.join(f'<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid var(--border)"><span style="color:var(--text2);font-size:12px">{k}</span><span style="font-size:12px;font-weight:600">{v}</span></div>' for k,v in [
+      ("Discord ID", user["discord_id"] or "—"),
+      ("Licence", user["license_key"] or "—"),
+      ("Connexions", str(user["connections"] or 0)),
+      ("Créé le", fmt_ts(user["created_at"])),
+      ("Dernier login", fmt_ts(user["last_login"])),
+    ])}
+  </div>
+  <div style="margin-top:10px">
+    <div style="font-size:11px;color:var(--text2);margin-bottom:4px">TAGS</div>
+    {tags_html}
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">🌍 Géolocalisation & Actions</div>
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px">
+    <div style="font-size:36px">{flag}</div>
+    <div>
+      <div style="font-size:16px;font-weight:700">{user["ip"] or "—"} {proxy_warn}</div>
+      <div style="color:var(--text2);font-size:13px">{city}, {country}</div>
+      <div style="color:var(--muted);font-size:11px">ISP: {isp}</div>
+    </div>
+  </div>
+  <div style="font-size:11px;color:var(--muted);font-family:monospace;margin-bottom:14px">HWID: {(user["hwid"] or "")[:36] or "—"}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:6px">
+    <form method="POST" action="/admin/user/{user['username']}/action" style="display:contents">
+      <button name="action" value="reactivate" class="btn btn-green btn-sm">✅ Activer</button>
+      <button name="action" value="suspend" class="btn btn-ghost btn-sm">⏸ Suspendre</button>
+      <button name="action" value="ban" class="btn btn-red btn-sm">🚫 Bannir</button>
+      <button name="action" value="reset_hwid" class="btn btn-ghost btn-sm">🔄 HWID</button>
+      <button name="action" value="reset_password" class="btn btn-ghost btn-sm">🔑 Reset MDP</button>
+      <button name="action" value="upgrade_pro" class="btn btn-sm btn-blue">⭐ PRO</button>
+      
+      <button name="action" value="downgrade_normal" class="btn btn-sm btn-gray">⬇ NORMAL</button>
+    </form>
+    <form method="POST" action="/admin/ips/add" style="display:contents">
+      <input type="hidden" name="ip" value="{user['ip'] or ''}">
+      <input type="hidden" name="rule" value="blacklist">
+      <button type="submit" class="btn btn-red btn-sm">🚫 Ban IP</button>
+    </form>
+    <form method="POST" action="/admin/ips/add" style="display:contents">
+      <input type="hidden" name="ip" value="{user['ip'] or ''}">
+      <input type="hidden" name="rule" value="whitelist">
+      <button type="submit" class="btn btn-green btn-sm">✅ Whitelist IP</button>
+    </form>
+  </div>
+</div>
+</div>
+
+<div class="card">
+  <div class="card-title">✏️ Modifier le profil</div>
+  <form method="POST" action="/admin/user/{user['username']}/edit">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;align-items:end">
+      <div class="form-group" style="margin:0"><label>Plan</label>
+        <select name="plan">
+          <option {'selected' if user['plan']=='NORMAL' else ''} value="NORMAL">NORMAL</option>
+          <option {'selected' if user['plan']=='PRO' else ''} value="PRO">PRO</option>
+
+        </select>
+      </div>
+      <div class="form-group" style="margin:0"><label>Discord ID</label><input name="discord_id" value="{user['discord_id'] or ''}"></div>
+      <div class="form-group" style="margin:0"><label>Tags (virgule)</label><input name="tags" value="{user['tags'] or ''}" placeholder="vip, suspect, pro..."></div>
+      <div class="form-group" style="margin:0"><label>Note interne</label><input name="note" value="{user['note'] or ''}"></div>
+      <button type="submit" class="btn btn-green btn-sm">💾 Sauvegarder</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+    🖥 Hardware &amp; Système
+    <span style="font-size:10px;color:var(--muted);font-weight:400">Mis à jour au dernier login</span>
+  </div>
+  <div class="hw-grid">{hw_html}</div>
+  <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+    <div style="font-size:11px;color:var(--text2);margin-bottom:8px;font-weight:700;text-transform:uppercase;letter-spacing:.5px">⚡ Actions rapides</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      <form method="POST" action="/admin/user/{user['username']}/action" style="display:contents">
+        <button name="action" value="reset_hwid" class="btn btn-ghost btn-sm">🔄 Reset HWID</button>
+      </form>
+      <a href="/admin/remote" class="btn btn-ghost btn-sm">🖥️ Remote Control</a>
+      <a href="/admin/ips?prefill={user['ip'] or ''}" class="btn btn-ghost btn-sm">🌐 Gérer IP</a>
+    </div>
+  </div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+<div class="card">
+  <div class="card-title">🕐 Historique connexions ({len(login_hist)})</div>
+  <div style="max-height:260px;overflow-y:auto">
+    {hist_html or '<div style="color:var(--muted);font-size:12px;text-align:center;padding:16px">Aucun historique</div>'}
+  </div>
+</div>
+<div class="card" id="notes">
+  <div class="card-title">📝 Notes admin</div>
+  <form method="POST" action="/admin/user/{user['username']}/note" style="margin-bottom:12px">
+    <div style="display:flex;gap:8px;align-items:center">
+      <input name="note" placeholder="Ajouter une note..." style="flex:1">
+      <select name="color" style="width:90px">
+        <option value="gray">Gris</option>
+        <option value="red">Rouge</option>
+        <option value="yellow">Jaune</option>
+        <option value="green">Vert</option>
+        <option value="blue">Bleu</option>
+      </select>
+      <button type="submit" class="btn btn-green btn-sm">+</button>
+    </div>
+  </form>
+  <div style="max-height:200px;overflow-y:auto">
+    {notes_html or '<div style="color:var(--muted);font-size:12px;text-align:center;padding:12px">Aucune note</div>'}
+  </div>
+</div>
+</div>
+
+{f'''<div class="card">
+  <div class="card-title">🖥️ Historique Remote Control</div>
+  <div class="tbl-wrap"><table><thead><tr><th>Début</th><th>Admin</th><th>Statut</th><th>Fin</th></tr></thead>
+  <tbody>{rem_html or '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:16px">Aucune session</td></tr>'}</tbody></table></div>
+</div>''' if True else ''}
+
+{f'<div class="card"><div class="card-title">🛡 Alertes HWID</div><div class="tbl-wrap"><table><thead><tr><th>Date</th><th>HWID</th><th>Alerte</th></tr></thead><tbody>{alert_rows}</tbody></table></div></div>' if alerts else ''}
+
+<div class="card">
+  <div class="card-title">📋 Logs récents</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Date</th><th>Niveau</th><th>Type</th><th>Message</th></tr></thead>
+    <tbody>{log_rows or '<tr><td colspan="4" style="color:var(--muted);text-align:center;padding:20px">Aucun log</td></tr>'}</tbody>
+  </table></div>
+</div>
+
+<div class="card" id="user-addons-section">
+  <div class="card-title">🎮 Addons activés</div>
+  <div id="user-addons-list" style="min-height:40px">
+    <script>
+    (function(){{
+      fetch('/admin/api/user_addons?username={user["username"]}')
+        .then(r=>r.json())
+        .then(d=>{{
+          const el = document.getElementById('user-addons-list');
+          if(!d.addons||d.addons.length===0){{el.innerHTML='<span style="color:var(--muted);font-size:12px">Aucun addon activé</span>';return;}}
+          const labels={{"fps_counter":"📊 FPS Counter","vibrance":"🎨 Vibrance","ram_cleaner":"🧹 RAM Cleaner","overclock":"⚡ Overclock","antilag":"🌐 Anti-Lag","process_boost":"🚀 Process Boost","crosshair":"🎯 Crosshair","gpu_tuner":"🖥 GPU Tuner","network_mon":"📡 Network Monitor","temp_mon":"🌡 Temp Monitor","input_lag":"⌨ Input Lag Reducer","boot_speed":"⚡ Boot Speed"}};
+          el.innerHTML = d.addons.map(a=>{{
+            const lbl = labels[a.key]||a.key;
+            const src = a.source==='pro_free'||a.source==='pro_free_auto' ? '<span class="badge b-blue">PRO gratuit</span>' : '<span class="badge b-green">Clé activée</span>';
+            return `<div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)"><span style="font-size:13px">${{lbl}}</span>${{src}}</div>`;
+          }}).join('');
+        }}).catch(()=>{{document.getElementById('user-addons-list').innerHTML='<span style="color:var(--red);font-size:12px">Erreur chargement</span>';}});
+    }})();
+    </script>
+  </div>
+</div>
+
+<a href="/admin/users" class="btn btn-ghost btn-sm">← Retour</a>
+"""
+    return _layout(f"Utilisateur — {user['username']}", "/admin/users", content, admin_user, admin_role)
+
+
+def _page_remote(active_sessions, sessions_db, admin_user, admin_role):
+    db_rows = ""
+    for s in sessions_db:
+        if s["status"]=="active":   sc='<span class="badge b-green">actif</span>'
+        elif s["status"]=="ended":  sc='<span class="badge b-gray">terminé</span>'
+        else:                       sc='<span class="badge b-yellow">en attente</span>'
+        dur = ""
+        if s.get("ended_at") and s.get("started_at"):
+            secs = int(s["ended_at"]) - int(s["started_at"])
+            dur = f"{secs//60}m{secs%60:02d}s"
+        db_rows += f"""<tr>
+          <td style="font-size:11px;font-family:monospace;color:var(--text2)">{s['id'][:16]}…</td>
+          <td><b>{s['username']}</b></td>
+          <td style="font-size:12px;color:var(--text2)">{s['admin_user'] or '—'}</td>
+          <td>{sc}</td>
+          <td style="font-size:11px;color:var(--text2)">{fmt_ts(s['started_at'])}</td>
+          <td style="font-size:11px;color:var(--text2)">{dur or '—'}</td>
+        </tr>"""
+
+    # Active session cards
+    session_cards = ""
+    if not active_sessions:
+        session_cards = '<div style="text-align:center;padding:36px;color:var(--muted);font-size:14px">🟡 Aucune session en attente ou active</div>'
+    else:
+        for sid, s in active_sessions.items():
+            geo = s.get("geo", {})
+            flag = geo.get("flag","🌐")
+            country = geo.get("country","?")
+            city = geo.get("city","?")
+            isp = geo.get("isp","?")
+            is_proxy = geo.get("proxy",False)
+            sw = s.get("screen_w",1920); sh = s.get("screen_h",1080)
+            frames = len(s.get("frames",[]))
+            age = int(time.time()) - s.get("started_at",int(time.time()))
+            age_str = f"{age//60}m{age%60:02d}s"
+            status_badge = f'<span class="badge b-green">🟢 actif</span>' if s["status"]=="active" else '<span class="badge b-yellow">🟡 en attente</span>'
+            proxy_warn = '<span class="badge b-red">⚠ PROXY/VPN</span>' if is_proxy else ''
+            chat_count = len([m for m in s.get("chat",[]) if m.get("from")=="user"])
+            session_cards += f"""
+<div style="background:var(--card2);border:1px solid var(--border);border-radius:14px;padding:18px;display:flex;align-items:center;gap:16px;margin-bottom:10px">
+  <div style="width:46px;height:46px;border-radius:50%;background:linear-gradient(135deg,var(--purple),var(--blue));display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;flex-shrink:0">{s['username'][0].upper()}</div>
+  <div style="flex:1;min-width:0">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
+      <span style="font-weight:800;font-size:15px">{s['username']}</span>
+      {status_badge} {proxy_warn}
+      {f'<span class="badge b-cyan">💬 {chat_count} msg</span>' if chat_count else ''}
+    </div>
+    <div style="font-size:12px;color:var(--text2);display:flex;flex-wrap:wrap;gap:12px">
+      <span>{flag} {city}, {country}</span>
+      <span>🌐 {s.get('ip','?')}</span>
+      <span>📡 {isp[:30]}</span>
+      <span>🖥️ {sw}×{sh}</span>
+      <span>⏱ {age_str}</span>
+      <span>🖼 {frames} frames</span>
+      {f'<span>💻 {s.get("os_info","")[:30]}</span>' if s.get("os_info") else ''}
+    </div>
+  </div>
+  <a href="/admin/remote/{sid}" class="btn btn-purple btn-sm" style="flex-shrink:0;white-space:nowrap">🖥️ Prendre le contrôle</a>
+</div>"""
+
+    content = f"""
+<div style="display:grid;grid-template-columns:2fr 1fr;gap:14px;margin-bottom:14px">
+<div class="card card-glow">
+  <div class="card-title">🖥️ Sessions actives / en attente ({len(active_sessions)})</div>
+  <div id="remote-sessions-list">{session_cards}</div>
+</div>
+
+<div>
+  <div class="card" style="margin-bottom:12px">
+    <div class="card-title">📊 Statistiques</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <div style="background:var(--card2);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:24px;font-weight:900;color:var(--green)">{len([s for s in active_sessions.values() if s.get('status')=='active'])}</div>
+        <div style="font-size:11px;color:var(--text2)">Actives</div>
+      </div>
+      <div style="background:var(--card2);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:24px;font-weight:900;color:var(--gold)">{len([s for s in active_sessions.values() if s.get('status')=='pending'])}</div>
+        <div style="font-size:11px;color:var(--text2)">En attente</div>
+      </div>
+      <div style="background:var(--card2);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:24px;font-weight:900;color:var(--purple)">{len(sessions_db)}</div>
+        <div style="font-size:11px;color:var(--text2)">Historique</div>
+      </div>
+      <div style="background:var(--card2);border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:24px;font-weight:900;color:var(--accent)">{len([s for s in sessions_db if s['status']=='ended'])}</div>
+        <div style="font-size:11px;color:var(--text2)">Terminées</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">ℹ️ Comment ça marche</div>
+    <ul style="color:var(--text2);font-size:12px;line-height:2;padding-left:14px">
+      <li>L'utilisateur clique <b>Demander support</b></li>
+      <li>Notification SSE en temps réel ici</li>
+      <li>Clique <b>Prendre le contrôle</b></li>
+      <li>Souris, clavier, scroll, drag &amp; drop</li>
+      <li>Chat live bidirectionnel</li>
+      <li>Contrôle qualité vidéo dynamique</li>
+      <li>Clipboard partagé admin ↔ client</li>
+      <li>Commandes système directes</li>
+    </ul>
+    <div style="margin-top:10px;padding:10px;background:rgba(0,255,136,.06);border-radius:8px;border:1px solid rgba(0,255,136,.15);font-size:11px;color:var(--text2)">
+      ⚡ HTTP polling ~80ms · JPEG quality adaptative<br>
+      🔒 Session chiffrée · GeoIP IPv4 complet
+    </div>
+  </div>
+</div>
+</div>
+
+<div class="card">
+  <div class="card-title">📋 Historique sessions ({len(sessions_db)})</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>ID</th><th>Utilisateur</th><th>Admin</th><th>Statut</th><th>Début</th><th>Durée</th></tr></thead>
+    <tbody>{db_rows or '<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--muted)">Aucune session</td></tr>'}</tbody>
+  </table></div>
+</div>
+
+<script>
+// Auto-refresh la liste des sessions toutes les 5s
+setInterval(function(){{ window.location.reload(); }}, 10000);
+</script>
+"""
+    return _layout("Remote Control", "/admin/remote", content, admin_user, admin_role)
+
+
+def _page_remote_viewer(session_id, sess, admin_user, admin_role):
+    username = sess.get("username","?")
+    ip = sess.get("ip","?")
+    geo = sess.get("geo",{})
+    flag = geo.get("flag","🌐")
+    country = geo.get("country","?")
+    city = geo.get("city","?")
+    isp = geo.get("isp","?")
+    is_proxy = geo.get("proxy",False)
+    sw = sess.get("screen_w",1920)
+    sh = sess.get("screen_h",1080)
+    os_info = sess.get("os_info","?")
+    status = sess.get("status","unknown")
+    proxy_warn = ' <span class="badge b-red">⚠ PROXY/VPN</span>' if is_proxy else ''
+
+    content = f"""
+<style>
+#remote-wrap{{display:grid;grid-template-columns:1fr 320px;gap:12px;height:calc(100vh - 160px);min-height:520px}}
+#remote-left{{display:flex;flex-direction:column;gap:8px;min-width:0}}
+#remote-right{{display:flex;flex-direction:column;gap:8px;overflow:hidden}}
+.remote-toolbar{{display:flex;gap:6px;padding:10px 12px;background:var(--card2);border-radius:10px;flex-wrap:wrap;align-items:center;border:1px solid var(--border)}}
+.remote-screen-wrap{{flex:1;background:#000;border-radius:10px;border:2px solid var(--border);position:relative;overflow:hidden;cursor:crosshair;min-height:300px}}
+#remote-img{{width:100%;height:100%;object-fit:contain;display:none;user-select:none;-webkit-user-select:none}}
+#remote-overlay{{position:absolute;top:0;left:0;right:0;bottom:0;cursor:crosshair}}
+#remote-cursor{{position:absolute;width:16px;height:16px;border:2px solid #ff4444;border-radius:50%;pointer-events:none;display:none;transform:translate(-50%,-50%);transition:left .05s,top .05s;box-shadow:0 0 6px rgba(255,68,68,.6)}}
+#remote-placeholder{{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--muted)}}
+.status-bar{{display:flex;gap:12px;align-items:center;padding:8px 12px;background:var(--card2);border-radius:8px;font-size:12px;color:var(--text2);flex-wrap:wrap;border:1px solid var(--border)}}
+.panel-card{{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:8px}}
+.panel-title{{font-size:12px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}}
+.chat-box{{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding:4px 0;min-height:80px;max-height:200px}}
+.chat-msg-admin{{background:linear-gradient(135deg,rgba(79,142,247,.2),rgba(124,92,191,.2));border-radius:8px 8px 4px 8px;padding:6px 10px;font-size:12px;align-self:flex-end;max-width:90%}}
+.chat-msg-user{{background:var(--card2);border-radius:8px 8px 8px 4px;padding:6px 10px;font-size:12px;align-self:flex-start;max-width:90%;border:1px solid var(--border)}}
+.quick-cmd-btn{{background:var(--card2);border:1px solid var(--border);color:var(--text2);border-radius:6px;padding:5px 8px;font-size:11px;cursor:pointer;transition:.15s;white-space:nowrap}}
+.quick-cmd-btn:hover{{border-color:var(--accent);color:var(--text)}}
+input[type=range]{{width:100%;accent-color:var(--accent)}}
+#zoom-level{{position:absolute;bottom:8px;right:8px;background:rgba(0,0,0,.6);color:#fff;padding:3px 8px;border-radius:4px;font-size:11px;pointer-events:none}}
+</style>
+
+<!-- TOOLBAR -->
+<div class="remote-toolbar">
+  <span class="badge b-purple">🖥 {username}</span>
+  <span style="font-size:11px;color:var(--text2)">{flag} {city}, {country} · {ip}{proxy_warn}</span>
+  <span class="badge b-gray" style="font-size:10px">🖥 {sw}×{sh}</span>
+  <span class="badge {'b-green' if status=='active' else 'b-yellow'}" id="conn-badge" style="font-size:11px">⏸ {status}</span>
+  <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+    <button class="btn btn-green btn-sm" id="btn-connect" onclick="connectSession()">🔗 Connecter</button>
+    <button class="btn btn-gray btn-sm" onclick="toggleZoom()">🔍 Zoom</button>
+    <button class="btn btn-gray btn-sm" onclick="takeScreenshot()">📸 Screenshot</button>
+    <button class="btn btn-gray btn-sm" onclick="toggleFullscreen()">⛶ Plein écran</button>
+    <button class="btn btn-red btn-sm" onclick="disconnectSession()">⏹ Déconnecter</button>
+  </div>
+</div>
+
+<!-- MAIN LAYOUT -->
+<div id="remote-wrap">
+
+<!-- LEFT: screen + status -->
+<div id="remote-left">
+  <div class="remote-screen-wrap" id="remote-screen">
+    <div id="remote-placeholder">
+      <div style="font-size:56px;margin-bottom:16px">🖥️</div>
+      <div style="font-size:16px;font-weight:700">En attente du stream</div>
+      <div style="font-size:12px;margin-top:8px;color:var(--muted)">Clique sur <b>Connecter</b> pour démarrer</div>
+    </div>
+    <img id="remote-img" draggable="false">
+    <div id="remote-overlay"></div>
+    <div id="remote-cursor"></div>
+    <div id="zoom-level" style="display:none">100%</div>
+  </div>
+
+  <div class="status-bar">
+    <span>🔴 <span id="remote-frame-status">Déconnecté</span></span>
+    <span>📡 <span id="fps-counter">FPS: —</span></span>
+    <span>🖼 <span id="frame-count">0</span> frames</span>
+    <span>⏱ <span id="session-age">0s</span></span>
+    <span>📶 <span id="latency">—</span></span>
+    <span style="margin-left:auto;font-size:11px;color:var(--muted)">📡 {isp[:25]} · 💻 {os_info[:30]}</span>
+  </div>
+
+  <!-- Frappe texte -->
+  <div style="display:flex;gap:8px">
+    <input id="type-input" placeholder="⌨ Texte à envoyer au PC distant (Entrée pour envoyer)..."
+      style="flex:1;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:9px 14px;color:var(--text);font-size:13px;outline:none"
+      onkeydown="if(event.key==='Enter')typeText()">
+    <button class="btn btn-green btn-sm" onclick="typeText()">Envoyer</button>
+  </div>
+</div>
+
+<!-- RIGHT: controls panel -->
+<div id="remote-right">
+
+  <!-- Info client -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title">👤 Client</div>
+    <div style="font-size:11px;color:var(--text2);line-height:1.8">
+      <div>👤 <b>{username}</b></div>
+      <div>🌐 {ip} {flag}</div>
+      <div>📍 {city}, {country}</div>
+      <div>📡 {isp[:28]}</div>
+      <div>🖥 {sw}×{sh} · {os_info[:28]}</div>
+      {'<div style="color:var(--red);font-weight:700">⚠ VPN/PROXY détecté</div>' if is_proxy else ''}
+    </div>
+  </div>
+
+  <!-- Qualité vidéo -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title">🎥 Qualité vidéo</div>
+    <div style="display:flex;gap:6px;align-items:center;font-size:11px;color:var(--text2)">
+      <span>Qualité</span>
+      <input type="range" id="quality-slider" min="10" max="95" value="50" oninput="updateQuality()">
+      <span id="quality-val" style="min-width:28px">50%</span>
+    </div>
+    <div style="display:flex;gap:6px;align-items:center;font-size:11px;color:var(--text2)">
+      <span>Vitesse</span>
+      <input type="range" id="speed-slider" min="30" max="500" value="80" step="10" oninput="updateQuality()">
+      <span id="speed-val" style="min-width:35px">80ms</span>
+    </div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap">
+      <button class="quick-cmd-btn" onclick="setPreset(80,30)">⚡ Rapide</button>
+      <button class="quick-cmd-btn" onclick="setPreset(65,60)">⚖ Équilibré</button>
+      <button class="quick-cmd-btn" onclick="setPreset(90,120)">🎨 HD</button>
+      <button class="quick-cmd-btn" onclick="setPreset(30,200)">🐢 Lent</button>
+    </div>
+  </div>
+
+  <!-- Commandes rapides clavier -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title">⌨ Raccourcis clavier</div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap">
+      <button class="quick-cmd-btn" onclick="sendKey('ctrl+c')">📋 Copier</button>
+      <button class="quick-cmd-btn" onclick="sendKey('ctrl+v')">📄 Coller</button>
+      <button class="quick-cmd-btn" onclick="sendKey('ctrl+z')">↩ Annuler</button>
+      <button class="quick-cmd-btn" onclick="sendKey('ctrl+a')">☑ Tout select.</button>
+      <button class="quick-cmd-btn" onclick="sendKey('ctrl+s')">💾 Sauvegarder</button>
+      <button class="quick-cmd-btn" onclick="sendKey('alt+f4')">✕ Fermer fenêtre</button>
+      <button class="quick-cmd-btn" onclick="sendKey('ctrl+alt+del')">⚡ Ctrl+Alt+Del</button>
+      <button class="quick-cmd-btn" onclick="sendKey('Escape')">⎋ Echap</button>
+      <button class="quick-cmd-btn" onclick="sendKey('Return')">↵ Entrée</button>
+      <button class="quick-cmd-btn" onclick="sendKey('Tab')">↹ Tab</button>
+      <button class="quick-cmd-btn" onclick="sendKey('win+d')">🖥 Bureau</button>
+      <button class="quick-cmd-btn" onclick="sendKey('win+l')">🔒 Verrouiller</button>
+      <button class="quick-cmd-btn" onclick="sendKey('win+e')">📁 Explorateur</button>
+      <button class="quick-cmd-btn" onclick="sendKey('PrintScreen')">📸 PrintScreen</button>
+    </div>
+  </div>
+
+  <!-- Commandes système -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title">⚙️ Actions système</div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap">
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:taskmgr')">📊 Gestionnaire tâches</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:cmd')">💻 Invite commandes</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:powershell')">🔵 PowerShell</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:regedit')">🗂 Regedit</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:msconfig')">⚙ MSConfig</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:control')">🎛 Panneau contrôle</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:notepad')">📝 Notepad</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:explorer')">📁 Explorer</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:mspaint')">🎨 Paint</button>
+      <button class="quick-cmd-btn" onclick="if(confirm('Redémarrer le PC ?'))sendCmd('SYSTEM:restart')">🔄 Redémarrer</button>
+      <button class="quick-cmd-btn" onclick="if(confirm('Éteindre le PC ?'))sendCmd('SYSTEM:shutdown')">⏹ Éteindre</button>
+    </div>
+    <!-- Run command custom -->
+    <div style="display:flex;gap:6px;margin-top:4px">
+      <input id="run-input" placeholder="Commande à lancer (ex: notepad.exe)..."
+        style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:12px;outline:none"
+        onkeydown="if(event.key==='Enter')runCustomCmd()">
+      <button class="quick-cmd-btn" onclick="runCustomCmd()">▶ Run</button>
+    </div>
+  </div>
+
+  <!-- Clipboard partagé -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title">📋 Clipboard partagé</div>
+    <textarea id="clipboard-content" rows="2" placeholder="Contenu clipboard client apparaîtra ici..."
+      style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:11px;resize:none;outline:none"></textarea>
+    <div style="display:flex;gap:4px">
+      <button class="quick-cmd-btn" onclick="sendClipboard()">📤 Envoyer au client</button>
+      <button class="quick-cmd-btn" onclick="copyClipboard()">📋 Copier ici</button>
+    </div>
+  </div>
+
+  <!-- Checkup système -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title" style="display:flex;justify-content:space-between;align-items:center">
+      🩺 Check-up système
+      <button class="quick-cmd-btn" onclick="runCheckup()" style="font-size:10px">▶ Lancer</button>
+    </div>
+    <div id="checkup-result" style="font-size:11px;color:var(--text2);line-height:1.9;min-height:30px">
+      <span style="color:var(--muted)">Clique ▶ pour analyser le PC distant</span>
+    </div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:cpu')">🖥 CPU</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:ram')">💾 RAM</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:disk')">💿 Disque</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:temp')">🌡 Temp</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:network')">📡 Réseau</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:gpu')">🎮 GPU</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:processes')">📋 Process</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('SYSINFO:startup')">⚡ Démarrage</button>
+    </div>
+  </div>
+
+  <!-- Infos matériel client -->
+  <div class="panel-card" style="flex-shrink:0">
+    <div class="panel-title">🖥️ Infos matériel</div>
+    <div style="font-size:11px;color:var(--text2);line-height:1.9">
+      <div>💻 <b>OS :</b> {os_info or '—'}</div>
+      <div style="font-size:10px;color:var(--muted)">📐 Résolution : {sw}×{sh}</div>
+    </div>
+    <div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:dxdiag')">🎮 DxDiag</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:msinfo32')">📋 MSInfo</button>
+      <button class="quick-cmd-btn" onclick="sendCmd('CMD:devmgmt.msc')">⚙ Périphériques</button>
+    </div>
+  </div>
+
+  <!-- Chat live -->
+  <div class="panel-card" style="flex:1;min-height:120px">
+    <div class="panel-title">💬 Chat live avec {username}</div>
+    <div class="chat-box" id="chat-box"></div>
+    <div style="display:flex;gap:6px">
+      <input id="chat-input" placeholder="Message..." onkeydown="if(event.key==='Enter')sendChat()"
+        style="flex:1;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:6px 10px;color:var(--text);font-size:12px;outline:none">
+      <button class="quick-cmd-btn" onclick="sendChat()">➤</button>
+    </div>
+  </div>
+
+</div><!-- /right -->
+</div><!-- /wrap -->
+
+<script>
+var SESSION_ID = '{session_id}';
+var _interval = null;
+var _frameCount = 0;
+var _lastFpsTime = Date.now();
+var _startTime = Date.now();
+var _zoom = 1.0;
+var _zoomMode = false;
+var _lastClip = "";
+var _lastChatTs = 0;
+var _sendTs = 0;
+var _inputReady = false;
+
+// ── FPS / Session age counter
+setInterval(function(){{
+  var now = Date.now();
+  var dt = (now - _lastFpsTime) / 1000;
+  if(dt > 0){{
+    document.getElementById('fps-counter').textContent = 'FPS: ~' + Math.round(_frameCount/dt);
+    _frameCount = 0; _lastFpsTime = now;
+  }}
+  var age = Math.round((now - _startTime)/1000);
+  document.getElementById('session-age').textContent = Math.floor(age/60)+'m'+String(age%60).padStart(2,'0')+'s';
+}}, 1000);
+
+// ── Connect
+function connectSession(){{
+  fetch('/admin/remote/'+SESSION_ID+'/connect',{{method:'POST'}})
+    .then(r=>r.json()).then(d=>{{
+      if(d.success){{
+        document.getElementById('conn-badge').textContent='🟢 Connecté';
+        document.getElementById('conn-badge').className='badge b-green';
+        document.getElementById('btn-connect').style.display='none';
+        document.getElementById('remote-frame-status').textContent='🟢 Connexion établie...';
+        startViewer();
+        if(!_inputReady){{ setupInput(); _inputReady=true; }}
+        showToast('Session démarrée !','green');
+      }}
+    }});
+}}
+
+// ── Frame polling
+function startViewer(){{
+  if(_interval) return;
+  var img = document.getElementById('remote-img');
+  var ph = document.getElementById('remote-placeholder');
+  var fc = document.getElementById('frame-count');
+  var total = 0;
+  var _pendingFetch=false;
+  function _pollFrame(){{
+    if(_pendingFetch) return;
+    _pendingFetch=true;
+    var t0=Date.now();
+    fetch('/admin/remote/'+SESSION_ID+'/frame')
+      .then(r=>r.json()).then(d=>{{
+        _pendingFetch=false;
+        var lat=Date.now()-t0;
+        document.getElementById('latency').textContent=lat+'ms';
+        if(d.frame){{
+          img.src='data:image/jpeg;base64,'+d.frame;
+          img.style.display='block';
+          if(ph) ph.style.display='none';
+          document.getElementById('remote-frame-status').textContent='🟢 Live';
+          _frameCount++; total++;
+          if(fc) fc.textContent=d.frames_recv||total;
+        }}
+        if(d.status==='ended'){{
+          clearInterval(_interval); _interval=null;
+          document.getElementById('remote-frame-status').textContent='🔴 Session terminée';
+          showToast('Session terminée par le client','yellow');
+        }}
+        // Clipboard update
+        if(d.clipboard && d.clipboard!==_lastClip){{
+          _lastClip=d.clipboard;
+          document.getElementById('clipboard-content').value=d.clipboard;
+        }}
+        // Chat messages from user
+        if(d.chat && d.chat.length){{
+          d.chat.forEach(function(m){{
+            if(m.ts>_lastChatTs){{
+              _lastChatTs=m.ts;
+              if(!parseSysInfo(m.text)){{
+                addChat(m.text,'user');
+              }}
+            }}
+          }});
+        }}
+      }}).catch(function(){{_pendingFetch=false;}});
+  }}
+  _interval = setInterval(_pollFrame, 80);
+}}
+
+function stopViewer(){{
+  if(_interval){{ clearInterval(_interval); _interval=null; }}
+}}
+
+function disconnectSession(){{
+  if(!confirm('Déconnecter la session de '+'{username}' +' ?')) return;
+  stopViewer();
+  fetch('/admin/remote/'+SESSION_ID+'/disconnect',{{method:'POST'}})
+    .then(()=>{{ window.location='/admin/remote'; }});
+}}
+
+// ── Input handling
+function setupInput(){{
+  var overlay = document.getElementById('remote-overlay');
+  var cursor  = document.getElementById('remote-cursor');
+  if(!overlay) return;
+
+  function relPos(e){{
+    var r=overlay.getBoundingClientRect();
+    return {{
+      x: Math.round((e.clientX-r.left)/r.width*10000)/100,
+      y: Math.round((e.clientY-r.top)/r.height*10000)/100
+    }};
+  }}
+
+  var _moveThrottle=0;
+  overlay.addEventListener('mousemove',function(e){{
+    var now=Date.now();
+    if(now-_moveThrottle<30) return;
+    _moveThrottle=now;
+    var p=relPos(e);
+    cursor.style.left=(p.x)+'%'; cursor.style.top=(p.y)+'%';
+    cursor.style.display='block';
+    sendCmd('MOVE:'+p.x+':'+p.y);
+  }});
+  overlay.addEventListener('mouseleave',function(){{
+    cursor.style.display='none';
+  }});
+  overlay.addEventListener('click',function(e){{
+    var p=relPos(e); sendCmd('CLICK:'+p.x+':'+p.y);
+    flashCursor();
+  }});
+  overlay.addEventListener('dblclick',function(e){{
+    var p=relPos(e); sendCmd('DBLCLICK:'+p.x+':'+p.y);
+  }});
+  overlay.addEventListener('contextmenu',function(e){{
+    e.preventDefault();
+    var p=relPos(e); sendCmd('RCLICK:'+p.x+':'+p.y);
+  }});
+  overlay.addEventListener('mousedown',function(e){{
+    if(e.button===0){{ var p=relPos(e); sendCmd('MOUSEDOWN:'+p.x+':'+p.y); }}
+  }});
+  overlay.addEventListener('mouseup',function(e){{
+    if(e.button===0){{ var p=relPos(e); sendCmd('MOUSEUP:'+p.x+':'+p.y); }}
+  }});
+  // Scroll
+  overlay.addEventListener('wheel',function(e){{
+    e.preventDefault();
+    var dir = e.deltaY>0?'down':'up';
+    var amt = Math.abs(Math.round(e.deltaY/30));
+    sendCmd('SCROLL:'+dir+':'+amt);
+  }},{{passive:false}});
+  // Keyboard
+  document.addEventListener('keydown',function(e){{
+    var tag=document.activeElement.tagName;
+    if(tag==='INPUT'||tag==='TEXTAREA') return;
+    var k=e.key;
+    var mods='';
+    if(e.ctrlKey) mods+='ctrl+';
+    if(e.shiftKey) mods+='shift+';
+    if(e.altKey) mods+='alt+';
+    if(e.metaKey) mods+='win+';
+    sendCmd('KEY:'+mods+k);
+    if(e.ctrlKey||e.altKey) e.preventDefault();
+  }});
+}}
+
+function flashCursor(){{
+  var c=document.getElementById('remote-cursor');
+  c.style.background='rgba(255,68,68,.5)';
+  setTimeout(()=>{{c.style.background=''}},150);
+}}
+
+// ── Checkup système
+function runCheckup(){{
+  var el=document.getElementById('checkup-result');
+  el.innerHTML='<span style="color:var(--yellow)">⏳ Analyse en cours...</span>';
+  sendCmd('SYSINFO:full');
+  // Simuler réception résultats via le chat SSE dans 2s (le client renvoie via chat)
+  setTimeout(function(){{
+    if(el.innerHTML.includes('Analyse')){{
+      el.innerHTML='<span style="color:var(--muted)">En attente de réponse du client... Assure-toi que le logiciel supporte SYSINFO:full</span>';
+    }}
+  }},4000);
+}}
+
+// Intercepter les messages SYSINFO du client dans le chat
+function parseSysInfo(text){{
+  if(!text||!text.startsWith('[SYSINFO]')) return false;
+  var el=document.getElementById('checkup-result');
+  if(el) el.innerHTML='<pre style="font-size:10px;color:var(--green);white-space:pre-wrap;margin:0">'+text.replace('[SYSINFO]','').trim()+'</pre>';
+  return true;
+}}
+
+// ── Commands
+function sendCmd(cmd){{
+  fetch('/admin/remote/'+SESSION_ID+'/command',{{
+    method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{cmd:cmd}})
+  }});
+}}
+function sendKey(k){{ sendCmd('KEY:'+k); showToast('Touche: '+k); }}
+
+// ── Type text
+function typeText(){{
+  var inp=document.getElementById('type-input');
+  var txt=inp?inp.value.trim():'';
+  if(txt){{ sendCmd('TYPE:'+txt); inp.value=''; showToast('Texte envoyé'); }}
+}}
+
+// ── Run custom command
+function runCustomCmd(){{
+  var inp=document.getElementById('run-input');
+  var cmd=inp?inp.value.trim():'';
+  if(cmd){{ sendCmd('CMD:'+cmd); inp.value=''; showToast('Commande: '+cmd); }}
+}}
+
+// ── Quality (debounce 400ms pour éviter spam)
+var _qualityTimer=null;
+function updateQuality(){{
+  var q=parseInt(document.getElementById('quality-slider').value);
+  var s=parseInt(document.getElementById('speed-slider').value);
+  document.getElementById('quality-val').textContent=q+'%';
+  document.getElementById('speed-val').textContent=s+'ms';
+  if(_qualityTimer) clearTimeout(_qualityTimer);
+  _qualityTimer=setTimeout(function(){{
+    fetch('/admin/remote/'+SESSION_ID+'/quality',{{
+      method:'POST',headers:{{'Content-Type':'application/json'}},
+      body:JSON.stringify({{quality:q,interval:s}})
+    }});
+  }},400);
+}}
+function setPreset(q,s){{
+  document.getElementById('quality-slider').value=q;
+  document.getElementById('speed-slider').value=s;
+  updateQuality();
+}}
+
+// ── Zoom
+function toggleZoom(){{
+  _zoomMode=!_zoomMode;
+  var screen=document.getElementById('remote-screen');
+  var img=document.getElementById('remote-img');
+  var zl=document.getElementById('zoom-level');
+  if(_zoomMode){{
+    img.style.cursor='zoom-in';
+    zl.style.display='block';
+    screen.addEventListener('wheel',handleZoom,{{passive:false}});
+    showToast('Zoom activé — scroll pour zoomer');
+  }}else{{
+    _zoom=1.0; img.style.transform='scale(1)';
+    img.style.cursor=''; zl.style.display='none';
+    screen.removeEventListener('wheel',handleZoom);
+    showToast('Zoom désactivé');
+  }}
+}}
+function handleZoom(e){{
+  e.preventDefault();
+  _zoom=Math.max(1,Math.min(5,_zoom+(e.deltaY<0?0.15:-0.15)));
+  document.getElementById('remote-img').style.transform='scale('+_zoom+')';
+  document.getElementById('zoom-level').textContent=Math.round(_zoom*100)+'%';
+}}
+
+// ── Screenshot
+function takeScreenshot(){{
+  var img=document.getElementById('remote-img');
+  if(!img||!img.src||img.style.display==='none'){{ showToast('Aucun frame','yellow'); return; }}
+  var a=document.createElement('a');
+  a.href=img.src;
+  a.download='remote_'+'{username}'+'_'+Date.now()+'.jpg';
+  a.click();
+  showToast('Screenshot sauvegardé');
+}}
+
+// ── Fullscreen
+function toggleFullscreen(){{
+  var el=document.getElementById('remote-screen');
+  if(!document.fullscreenElement){{ el.requestFullscreen&&el.requestFullscreen(); }}
+  else{{ document.exitFullscreen&&document.exitFullscreen(); }}
+}}
+
+// ── Clipboard
+function sendClipboard(){{
+  var txt=document.getElementById('clipboard-content').value;
+  if(txt){{ sendCmd('SETCLIP:'+btoa(unescape(encodeURIComponent(txt)))); showToast('Clipboard envoyé'); }}
+}}
+function copyClipboard(){{
+  var txt=document.getElementById('clipboard-content').value;
+  if(txt){{ navigator.clipboard&&navigator.clipboard.writeText(txt); showToast('Copié'); }}
+}}
+
+// ── Chat
+function addChat(text,from){{
+  var box=document.getElementById('chat-box');
+  var div=document.createElement('div');
+  div.className=from==='admin'?'chat-msg-admin':'chat-msg-user';
+  div.innerHTML='<span style="opacity:.6;font-size:10px">'+( from==='admin'?'Vous':'👤 '+'{username}')+'</span><br>'+escapeHtml(text);
+  box.appendChild(div);
+  box.scrollTop=box.scrollHeight;
+}}
+function sendChat(){{
+  var inp=document.getElementById('chat-input');
+  var txt=inp?inp.value.trim():'';
+  if(!txt) return;
+  inp.value='';
+  addChat(txt,'admin');
+  fetch('/admin/remote/'+SESSION_ID+'/chat',{{
+    method:'POST',headers:{{'Content-Type':'application/json'}},
+    body:JSON.stringify({{text:txt}})
+  }});
+}}
+function escapeHtml(t){{
+  return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}}
+</script>
+"""
+    return _layout(f"🖥️ Remote — {username}", "/admin/remote", content, admin_user, admin_role)
+
+
+def _page_addons(addon_keys, stats, admin_user, admin_role):
+    ADDON_META = {
+        "crosshair":     ("🎯", "Crosshair Overlay",       "4.99€"),
+        "fps_counter":   ("📊", "FPS Counter",             "2.99€"),
+        "vibrance":      ("🎨", "Filtre Couleur / Vibrance","2.99€"),
+        "ram_cleaner":   ("🧹", "RAM Cleaner Auto",        "1.99€"),
+        "overclock":     ("⚡", "Overclock CPU/GPU",        "7.99€"),
+        "antilag":       ("🌐", "Anti-Lag Réseau Pro",      "4.99€"),
+        "process_boost": ("🚀", "Process Priority Booster", "3.99€"),
+        "gpu_tuner":     ("🖥", "GPU Auto-Tuner",           "5.99€"),
+        "network_mon":   ("📡", "Network Monitor",          "2.99€"),
+        "temp_mon":      ("🌡", "Temperature Monitor",      "1.99€"),
+        "input_lag":     ("⌨", "Input Lag Reducer",        "3.99€"),
+        "boot_speed":    ("⚡", "Boot Speed Pro",           "2.99€"),
+    }
+    stat_cards = ""
+    for key, (ico, name, price) in ADDON_META.items():
+        a = stats.get(key, {"active":0,"used":0})
+        stat_cards += f'''<div class="stat-card">
+          <div class="stat-top"><div class="stat-icon">{ico}</div><span class="badge b-cyan">{price} · ♾️ Lifetime</span></div>
+          <div style="font-weight:700;font-size:14px;margin:6px 0 2px">{name}</div>
+          <div style="display:flex;gap:8px;margin-top:6px">
+            <span class="badge b-green">{a["active"]} active(s)</span>
+            <span class="badge b-gray">{a["used"]} utilisée(s)</span>
+          </div>
+          <form method="POST" action="/admin/addons/generate" style="margin-top:10px;display:flex;gap:6px">
+            <input type="hidden" name="addon_key" value="{key}">
+            <input name="qty" type="number" value="1" min="1" max="100" style="width:60px">
+            <input name="note" placeholder="Note" style="flex:1">
+            <button type="submit" class="btn btn-purple btn-sm">✨ Générer</button>
+          </form>
+        </div>'''
+
+    ADDON_NAMES = {k: f"{v[0]} {v[1]}" for k, v in ADDON_META.items()}
+    rows = ""
+    filter_addon = ""
+    for a in addon_keys:
+        if a["status"]=="active": sc='<span class="badge b-green">active</span>'
+        elif a["status"]=="used": sc='<span class="badge b-gray">utilisée</span>'
+        else: sc=f'<span class="badge b-red">{a["status"]}</span>'
+        label = ADDON_NAMES.get(a["addon_key"], a["addon_key"])
+        revoke = f'<form method="POST" action="/admin/addons/revoke"><input type="hidden" name="key" value="{a["key"]}"><button class="btn btn-red btn-sm">Révoquer</button></form>' if a["status"]=="active" else "—"
+        rows += f'<tr><td style="font-family:monospace;font-size:11px;cursor:pointer" onclick="copyText(\'{a["key"]}\')" title="Copier">{a["key"]}</td><td><span class="badge b-purple">{label}</span></td><td>{sc}</td><td><span class="badge b-cyan">♾️ Lifetime</span></td><td style="font-size:11px;color:var(--text2)">{fmt_ts(a["created_at"])}</td><td style="font-size:11px;color:var(--text2)">{a["note"] or "—"}</td><td>{revoke}</td></tr>'
+
+    content = f"""
+<div class="stats-grid" style="grid-template-columns:repeat(auto-fill,minmax(240px,1fr))">{stat_cards}</div>
+<div class="card" style="margin-top:14px">
+  <div class="card-title">🎮 Toutes les clés addon ({len(addon_keys)}) — Durée : ♾️ Lifetime (toutes)</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Clé</th><th>Addon</th><th>Statut</th><th>Durée</th><th>Créée</th><th>Note</th><th></th></tr></thead>
+    <tbody>{rows or '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--muted)">Aucune clé addon</td></tr>'}</tbody>
+  </table></div>
+</div>"""
+    return _layout("Addons", "/admin/addons", content, admin_user, admin_role)
+
+
+def _page_keys(keys, addon_keys, admin_user, admin_role):
+    rows = ""
+    for k in keys:
+        if k["status"]=="active": sb='<span class="badge b-green">active</span>'
+        elif k["status"]=="revoked": sb='<span class="badge b-red">révoquée</span>'
+        else: sb=f'<span class="badge b-gray">{k["status"]}</span>'
+        if k["plan"]=="PRO": pb='<span class="badge b-blue">⭐ PRO</span>'
+        else: pb='<span class="badge b-gray">NORMAL</span>'
+        used = f'<a href="/admin/user/{k["username"]}"><b>{k["username"]}</b></a>' if k["username"] else '<span style="color:var(--muted)">—</span>'
+        rows += f'<tr><td style="font-family:monospace;font-size:11px" onclick="copyText(\'{k["key"]}\')" title="Cliquer pour copier" style="cursor:pointer">{k["key"]}</td><td>{pb}</td><td>{sb}</td><td>{used}</td><td style="font-size:11px;color:var(--text2)">{fmt_ts(k["created_at"])}</td><td style="font-size:11px;color:var(--text2)">{k["note"] or "—"}</td><td><form method="POST" action="/admin/keys/revoke"><input type="hidden" name="key" value="{k["key"]}"><button class="btn btn-red btn-sm">Révoquer</button></form></td></tr>'
+
+    addon_rows = ""
+    ADDON_NAMES = {"crosshair":"🎯 Crosshair","fps_counter":"📊 FPS Counter","vibrance":"🎨 Vibrance",
+                   "ram_cleaner":"🧹 RAM Cleaner","overclock":"⚡ Overclock","antilag":"🌐 Anti-Lag",
+                   "process_boost":"🚀 Process Boost","gpu_tuner":"🖥 GPU Tuner","network_mon":"📡 Network Mon",
+                   "temp_mon":"🌡 Temp Monitor","input_lag":"⌨ Input Lag","boot_speed":"⚡ Boot Speed"}
+    for a in addon_keys:
+        sc = '<span class="badge b-green">active</span>' if a["status"]=="active" else '<span class="badge b-gray">utilisée</span>' if a["status"]=="used" else f'<span class="badge b-red">{a["status"]}</span>'
+        addon_label = ADDON_NAMES.get(a["addon_key"], a["addon_key"])
+        revoke_btn = f'<form method="POST" action="/admin/addons/revoke"><input type="hidden" name="key" value="{a["key"]}"><button class="btn btn-red btn-sm">Révoquer</button></form>' if a["status"]=="active" else "—"
+        addon_rows += f'<tr><td style="font-family:monospace;font-size:11px;cursor:pointer" onclick="copyText(\'{a["key"]}\')" title="Cliquer pour copier">{a["key"]}</td><td><span class="badge b-purple">{addon_label}</span></td><td>{sc}</td><td><span class="badge b-cyan">♾️ Lifetime</span></td><td style="font-size:11px;color:var(--text2)">{fmt_ts(a["created_at"])}</td><td style="font-size:11px;color:var(--text2)">{a["note"] or "—"}</td><td>{revoke_btn}</td></tr>'
+
+    addon_options = "\n".join(f'<option value="{k}">{v}</option>' for k, v in [
+        ("crosshair","🎯 Crosshair Overlay"),("fps_counter","📊 FPS Counter"),
+        ("vibrance","🎨 Filtre Couleur / Vibrance"),("ram_cleaner","🧹 RAM Cleaner Auto"),
+        ("overclock","⚡ Overclock CPU/GPU"),("antilag","🌐 Anti-Lag Réseau Pro"),
+        ("process_boost","🚀 Process Priority Booster"),("gpu_tuner","🖥 GPU Auto-Tuner"),
+        ("network_mon","📡 Network Monitor"),("temp_mon","🌡 Temperature Monitor"),
+        ("input_lag","⌨ Input Lag Reducer"),("boot_speed","⚡ Boot Speed Pro"),
+    ])
+
+    content = f"""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+<div class="card">
+  <div class="card-title">🔑 Générer des licences</div>
+  <form method="POST" action="/admin/keys/generate">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <div class="form-group" style="margin:0"><label>Plan</label><select name="plan"><option value="NORMAL">NORMAL</option><option value="PRO">⭐ PRO</option></select></div>
+      <div class="form-group" style="margin:0"><label>Quantité (max 500)</label><input name="qty" type="number" value="1" min="1" max="500"></div>
+    </div>
+    <div class="form-group" style="margin:6px 0 0"><label>Note</label><input name="note" placeholder="Batch Discord, resell..."></div>
+    <button type="submit" class="btn btn-green" style="margin-top:8px;width:100%">✨ Générer licences</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">🧪 Générer des clés Addon</div>
+  <form method="POST" action="/admin/keys/generate_addon">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+      <div class="form-group" style="margin:0"><label>Addon</label><select name="addon_key">{addon_options}</select></div>
+      <div class="form-group" style="margin:0"><label>Quantité (max 100)</label><input name="qty" type="number" value="1" min="1" max="100"></div>
+    </div>
+    <div class="form-group" style="margin:6px 0 0"><label>Note</label><input name="note" placeholder="Pour qui..."></div>
+    <button type="submit" class="btn btn-purple" style="margin-top:8px;width:100%">✨ Générer clés addon</button>
+  </form>
+</div>
+</div>
+
+<div class="card">
+  <div class="card-title">🗑 Révoquer en masse</div>
+  <form method="POST" action="/admin/keys/bulk_revoke" style="display:flex;gap:8px;align-items:flex-end">
+    <div style="flex:1"><label style="font-size:12px;font-weight:600;color:var(--text2)">Clés (une par ligne)</label>
+    <textarea name="keys" rows="3" placeholder="XXXXX-XXXXX-XXXXX-XXXXX"></textarea></div>
+    <button type="submit" class="btn btn-red" style="height:42px">🗑 Révoquer</button>
+  </form>
+</div>
+
+<div class="card">
+  <div class="card-title">🔑 Licences ({len(keys)})</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Clé</th><th>Plan</th><th>Statut</th><th>Utilisateur</th><th>Créée</th><th>Note</th><th></th></tr></thead>
+    <tbody>{rows or '<tr><td colspan="7" style="text-align:center;padding:30px;color:var(--muted)">Aucune clé</td></tr>'}</tbody>
+  </table></div>
+</div>
+
+<div class="card">
+  <div class="card-title">🎮 Clés Addon ({len(addon_keys)})</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>Clé</th><th>Addon</th><th>Statut</th><th>Durée</th><th>Créée</th><th>Note</th><th></th></tr></thead>
+    <tbody>{addon_rows or '<tr><td colspan="7" style="text-align:center;padding:20px;color:var(--muted)">Aucune clé addon</td></tr>'}</tbody>
+  </table></div>
+</div>"""
+    return _layout("Licences", "/admin/keys", content, admin_user, admin_role)
+
+
+def _page_keys_result(keys, plan, key_type, admin_user, admin_role):
+    keys_disp = "<br>".join(f'<span style="font-family:monospace;font-size:13px;color:var(--green)">{k}</span>' for k in keys)
+    textarea_val = "\n".join(keys)
+    content = f"""
+<div class="alert alert-green">✅ {len(keys)} clé(s) {plan} ({key_type}) générée(s) !</div>
+<div class="card"><div class="card-title">Clés générées</div>
+  <div style="margin-bottom:12px;line-height:1.8">{keys_disp}</div>
+  <textarea style="font-family:monospace;font-size:12px;height:100px">{textarea_val}</textarea>
+  <div style="margin-top:10px;display:flex;gap:8px">
+    <a href="/admin/keys" class="btn btn-green">→ Voir toutes les clés</a>
+    <button onclick="copyText(`{textarea_val.replace(chr(96),'').replace(chr(10),chr(92)+'n')}`);showToast('Copié !')" class="btn btn-gray">📋 Copier tout</button>
+  </div>
+</div>"""
+    return _layout("Clés générées", "/admin/keys", content, admin_user, admin_role)
+
+
+def _page_maintenance(maint_both, maint_soft, maint_site, maint_msg, announce, announce_color, admin_user, admin_role):
+    def _card(label, icon, active, target, color):
+        return f"""
+<div class="card" style="border-color:{'rgba(255,68,102,.3)' if active else 'var(--border)'}">
+  <div style="text-align:center;padding:20px 0">
+    <div style="font-size:42px;margin-bottom:8px">{icon}</div>
+    <div style="font-size:16px;font-weight:800;color:{'var(--red)' if active else 'var(--green)'};margin-bottom:6px">
+      {'🔴 EN MAINTENANCE' if active else '🟢 EN LIGNE'}
+    </div>
+    <div style="color:var(--text2);font-size:12px;margin-bottom:16px">{label}</div>
+    <form method="POST" style="display:flex;gap:8px;justify-content:center">
+      <input type="hidden" name="target" value="{target}">
+      <input type="hidden" name="state" value="{'0' if active else '1'}">
+      <button type="submit" class="btn {'btn-green' if active else 'btn-red'}" style="padding:10px 24px">
+        {'✅ Désactiver' if active else '🔴 Activer'}
+      </button>
+    </form>
+  </div>
+</div>"""
+
+    content = f"""
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:14px">
+  {_card("Logiciel uniquement", "🖥️", maint_soft, "soft", "red")}
+  {_card("Site web uniquement", "🌐", maint_site, "site", "red")}
+  {_card("Logiciel + Site web", "🔒", maint_both, "both", "red")}
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+<div class="card">
+  <div class="card-title">📝 Message de maintenance</div>
+  <form method="POST">
+    <input type="hidden" name="target" value="both">
+    <input type="hidden" name="state" value="{'1' if maint_both else '0'}">
+    <div class="form-group"><textarea name="msg_text" rows="3">{maint_msg}</textarea></div>
+    <button type="submit" class="btn btn-blue btn-sm">💾 Sauvegarder</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">📢 Annonce en bandeau</div>
+  <form method="POST">
+    <input type="hidden" name="target" value="both">
+    <input type="hidden" name="state" value="{'1' if maint_both else '0'}">
+    <div class="form-group"><label>Texte (vide = masqué)</label><input name="announce" value="{announce}" placeholder="Nouvelle version v8.0 disponible !"></div>
+    <div class="form-group"><label>Couleur</label>
+      <select name="announce_color">
+        <option {'selected' if announce_color=='blue' else ''} value="blue">Bleu</option>
+        <option {'selected' if announce_color=='green' else ''} value="green">Vert</option>
+        <option {'selected' if announce_color=='red' else ''} value="red">Rouge</option>
+        <option {'selected' if announce_color=='yellow' else ''} value="yellow">Jaune</option>
+        <option {'selected' if announce_color=='purple' else ''} value="purple">Violet</option>
+      </select>
+    </div>
+    <button type="submit" class="btn btn-blue btn-sm">💾 Sauvegarder</button>
+  </form>
+</div>
+</div>"""
+    return _layout("Maintenance", "/admin/maintenance", content, admin_user, admin_role)
+
+
+def _page_ips(rules, vpn_block, prefill, admin_user, admin_role):
+    rows = ""
+    for r in rules:
+        color = "var(--green)" if r["rule"]=="whitelist" else "var(--red)"
+        badge = f'<span class="badge {"b-green" if r["rule"]=="whitelist" else "b-red"}">{r["rule"]}</span>'
+        rows += f'<tr><td style="font-family:monospace;font-weight:700;color:{color}">{r["ip"]}</td><td>{badge}</td><td style="font-size:12px;color:var(--text2)">{r["note"] or "—"}</td><td style="font-size:11px;color:var(--muted)">{fmt_ts(r["added_at"])}</td><td><form method="POST" action="/admin/ips/delete"><input type="hidden" name="ip" value="{r["ip"]}"><button class="btn btn-red btn-sm">✕</button></form></td></tr>'
+
+    content = f"""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px">
+<div class="card">
+  <div class="card-title">➕ Ajouter une règle IP</div>
+  <form method="POST" action="/admin/ips/add">
+    <div class="form-group"><label>Adresse IPv4</label><input name="ip" value="{prefill}" placeholder="123.45.67.89" required></div>
+    <div class="form-group"><label>Règle</label><select name="rule"><option value="blacklist">🚫 Blacklist</option><option value="whitelist">✅ Whitelist</option></select></div>
+    <div class="form-group"><label>Note</label><input name="note" placeholder="raison..."></div>
+    <button type="submit" class="btn btn-green">Ajouter</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">🔒 Blocage VPN/Proxy</div>
+  <div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--card2);border-radius:10px;border:1px solid var(--border)">
+    <form method="POST" action="/admin/ips/vpn" id="vpnform"></form>
+    <label class="toggle"><input type="checkbox" {'checked' if vpn_block else ''} onchange="document.getElementById('vpnform').submit()"><span class="toggle-s"></span></label>
+    <div>
+      <div style="font-weight:700">Bloquer VPN & Proxies</div>
+      <div style="color:var(--text2);font-size:12px">Détection via ip-api.com</div>
+    </div>
+    <span class="badge {'b-green' if vpn_block else 'b-gray'}">{'ACTIF' if vpn_block else 'INACTIF'}</span>
+  </div>
+  <div style="margin-top:14px;color:var(--text2);font-size:12px;line-height:1.8">
+    <b style="color:var(--text)">Whitelist</b>: Si ≥1 IP en whitelist, <u>seules</u> ces IPs passent.<br>
+    <b style="color:var(--text)">Blacklist</b>: Ces IPs sont bloquées immédiatement.
+  </div>
+</div>
+</div>
+<div class="card">
+  <div class="card-title">📋 Règles IP ({len(rules)})</div>
+  <div class="tbl-wrap"><table>
+    <thead><tr><th>IP</th><th>Règle</th><th>Note</th><th>Ajoutée</th><th></th></tr></thead>
+    <tbody>{rows or '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--muted)">Aucune règle</td></tr>'}</tbody>
+  </table></div>
+</div>"""
+    return _layout("IPs / Whitelist", "/admin/ips", content, admin_user, admin_role)
+
+
+def _page_resets(resets, admin_user, admin_role):
+    rows = ""
+    for r in resets:
+        sb = f'<span class="badge {"b-yellow" if r["status"]=="pending" else "b-green" if r["status"]=="approved" else "b-red"}">{r["status"]}</span>'
+        actions = ""
+        if r["status"] == "pending":
+            actions = f'''<form method="POST" action="/admin/resets/{r["id"]}/approve" style="display:inline"><button class="btn btn-green btn-sm">✅</button></form>
+                         <form method="POST" action="/admin/resets/{r["id"]}/deny" style="display:inline"><button class="btn btn-red btn-sm">❌</button></form>'''
+        rows += f'<tr><td>#{r["id"]}</td><td><a href="/admin/user/{r["username"]}"><b>{r["username"] or "—"}</b></a></td><td style="font-size:12px;color:var(--text2)">{r["discord_id"] or "—"}</td><td><span class="badge b-gray">{r["type"]}</span></td><td>{sb}</td><td style="font-family:monospace;font-size:12px;color:var(--green)">{r["temp_pass"] or "—"}</td><td style="font-size:11px;color:var(--muted)">{fmt_ts_rel(r["requested_at"])}</td><td>{actions}</td></tr>'
+    content = f"""<div class="tbl-wrap"><table>
+    <thead><tr><th>#</th><th>Username</th><th>Discord ID</th><th>Type</th><th>Statut</th><th>MDP temp</th><th>Quand</th><th>Actions</th></tr></thead>
+    <tbody>{rows or '<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--muted)">Aucune demande</td></tr>'}</tbody>
+  </table></div>"""
+    return _layout("Demandes de reset", "/admin/resets", content, admin_user, admin_role)
+
+
+def _page_tickets(tickets, admin_user, admin_role):
+    rows = ""
+    for t in tickets:
+        if t["status"]=="open": sc='<span class="badge b-yellow">open</span>'
+        elif t["status"]=="answered": sc='<span class="badge b-blue">répondu</span>'
+        else: sc='<span class="badge b-gray">fermé</span>'
+        if t["priority"]=="urgent": pc='<span class="badge b-red">🔥 urgent</span>'
+        elif t["priority"]=="high": pc='<span class="badge b-orange">⬆ élevé</span>'
+        else: pc='<span class="badge b-gray">normal</span>'
+        safe_msg = t["message"][:200].replace("`","").replace("'","").replace('"','').replace('<','').replace('>','')
+        safe_resp = (t["response"] or "").replace("`","").replace("'","").replace('"','').replace('<','').replace('>','')
+        rows += f"""<tr>
+          <td>#{t["id"]}</td>
+          <td><a href="/admin/user/{t['user'] or ''}"><b>{t['user'] or 'Anonyme'}</b></a></td>
+          <td style="font-size:12px">{t['subject'][:40]}</td>
+          <td>{sc}</td><td>{pc}</td>
+          <td style="font-size:11px;color:var(--muted)">{fmt_ts_rel(t['created_at'])}</td>
+          <td><button onclick="openTicket({t['id']},`{safe_msg}`,`{safe_resp}`)" class="btn btn-ghost btn-sm">Répondre</button></td>
+        </tr>"""
+    content = f"""
+<div style="margin-bottom:10px;display:flex;gap:6px">
+  <a href="/admin/tickets" class="btn btn-sm {'btn-green' if True else 'btn-gray'}">Tous</a>
+  <a href="/admin/tickets?priority=urgent" class="btn btn-sm btn-red">🔥 Urgents</a>
+  <a href="/admin/tickets?priority=high" class="btn btn-sm btn-ghost">⬆ Élevés</a>
+</div>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>#</th><th>Utilisateur</th><th>Sujet</th><th>Statut</th><th>Priorité</th><th>Date</th><th></th></tr></thead>
+  <tbody>{rows or '<tr><td colspan="7" style="text-align:center;padding:24px;color:var(--muted)">Aucun ticket</td></tr>'}</tbody>
+</table></div>
+
+<div id="ticket-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:999;align-items:center;justify-content:center;padding:16px">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:16px;padding:24px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto">
+    <h3 style="margin-bottom:12px;font-size:16px">💬 Répondre au ticket</h3>
+    <div id="ticket-msg-display" style="background:var(--card2);border-radius:8px;padding:12px;color:var(--text2);font-size:13px;margin-bottom:12px;max-height:120px;overflow-y:auto;white-space:pre-wrap"></div>
+    <form id="ticket-form" method="POST">
+      <div class="form-group"><label>Réponse</label><textarea name="response" id="ticket-response" rows="4" placeholder="Votre réponse..."></textarea></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="submit" name="close" value="0" class="btn btn-blue">📩 Répondre</button>
+        <button type="submit" name="close" value="1" class="btn btn-green">✅ Répondre & Fermer</button>
+        <button type="button" onclick="closeTicket()" class="btn btn-ghost">Annuler</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function openTicket(id,msg,resp){{
+  document.getElementById('ticket-msg-display').textContent=msg;
+  document.getElementById('ticket-response').value=resp||'';
+  document.getElementById('ticket-form').action='/admin/tickets/'+id+'/reply';
+  document.getElementById('ticket-modal').style.display='flex';
+}}
+function closeTicket(){{document.getElementById('ticket-modal').style.display='none'}}
+</script>"""
+    return _layout("Tickets Support", "/admin/tickets", content, admin_user, admin_role)
+
+
+def _page_logs(logs, filter_type, admin_user, admin_role):
+    rows = ""
+    for l in logs:
+        lc = "b-green" if l["level"]=="OK" else "b-red" if l["level"]=="ERROR" else "b-yellow"
+        rows += f'<tr><td style="color:var(--muted);font-size:11px;white-space:nowrap">{fmt_ts(l["ts"])}</td><td><span class="badge {lc}">{l["level"]}</span></td><td style="font-size:11px;color:var(--text2)">{l["type"]}</td><td style="font-size:12px">{l["msg"][:100]}</td><td style="font-size:12px;color:var(--blue)">{l["user"] or "—"}</td></tr>'
+    types = ["LOGIN","REGISTER","ANTI-CRACK","ANTI-LEAK","KEYS","ADDON","ADMIN","RESET","BROADCAST","IP","REMOTE"]
+    filter_btns = " ".join(f'<a href="/admin/logs?type={t}" class="btn btn-sm {"btn-green" if filter_type==t else "btn-ghost"}">{t}</a>' for t in types)
+    content = f"""
+<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+  <a href="/admin/logs" class="btn btn-sm {"btn-green" if not filter_type else "btn-ghost"}">Tous</a>
+  {filter_btns}
+</div>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Date</th><th>Niveau</th><th>Type</th><th>Message</th><th>User</th></tr></thead>
+  <tbody>{rows or '<tr><td colspan="5" style="text-align:center;padding:24px;color:var(--muted)">Aucun log</td></tr>'}</tbody>
+</table></div>"""
+    return _layout("Logs système", "/admin/logs", content, admin_user, admin_role)
+
+
+def _page_broadcast(msg_sent, admin_user, admin_role):
+    content = f"""
+{f'<div class="alert alert-green">{msg_sent}</div>' if msg_sent else ''}
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+<div class="card">
+  <div class="card-title">📢 Message Discord</div>
+  <form method="POST">
+    <div class="form-group"><label>Cible</label>
+      <select name="target"><option value="all">Tous les actifs (avec Discord)</option><option value="pro">PRO uniquement</option><option value="normal">NORMAL uniquement</option></select>
+    </div>
+    <div class="form-group"><label>Message</label><textarea name="message" rows="5" placeholder="Votre annonce..."></textarea></div>
+    <button type="submit" class="btn btn-green">📤 Envoyer</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">📋 Templates</div>
+  <div style="display:flex;flex-direction:column;gap:8px">
+    {''.join(f'<div class="card-sm" style="cursor:pointer" onclick="document.querySelector(\'textarea[name=message]\').value=`{t[1].replace(chr(96),chr(39))}`"><div style="font-weight:700;font-size:12px;margin-bottom:4px">{t[0]}</div><div style="font-size:11px;color:var(--text2)">{t[1][:80]}...</div></div>' for t in [
+      ("🔔 Nouvelle mise à jour", "⚡ WinOptimizer Pro a été mis à jour !\n\nNouvelles fonctionnalités disponibles. Relancez l'application pour profiter des améliorations."),
+      ("⚠ Maintenance planifiée", "🔧 Une maintenance est planifiée ce soir à 23h.\n\nDurée estimée : 30 minutes. L'accès sera temporairement indisponible."),
+      ("🎉 Promo PRO", "⭐ Offre spéciale PRO disponible !\n\nMontez en PRO avec 20% de réduction. Contactez le support pour en profiter."),
+    ])}
+  </div>
+</div>
+</div>"""
+    return _layout("Broadcast", "/admin/broadcast", content, admin_user, admin_role)
+
+
+def _page_owners(admins, admin_user, admin_role):
+    rows = ""
+    for a in admins:
+        rb = f'<span class="badge {"b-yellow" if a["role"]=="owner" else "b-blue" if a["role"]=="admin" else "b-gray"}">{a["role"]}</span>'
+        del_btn = "" if a["username"]=="xywez" else f'<form method="POST" action="/admin/owners/delete" style="display:inline"><input type="hidden" name="username" value="{a["username"]}"><button class="btn btn-red btn-sm">🗑</button></form>'
+        rows += f'<tr><td><b>{a["username"]}</b></td><td>{rb}</td><td style="font-size:11px;color:var(--muted)">{fmt_ts(a["created_at"])}</td><td style="font-size:12px;color:var(--text2)">{a["created_by"] or "système"}</td><td>{del_btn}</td></tr>'
+    content = f"""
+<div class="card">
+  <div class="card-title">➕ Ajouter un admin</div>
+  <form method="POST" action="/admin/owners/create">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;align-items:end">
+      <div class="form-group" style="margin:0"><label>Username</label><input name="username" placeholder="username"></div>
+      <div class="form-group" style="margin:0"><label>Mot de passe</label><input name="password" type="password"></div>
+      <div class="form-group" style="margin:0"><label>Rôle</label><select name="role"><option value="staff">Staff</option><option value="admin">Admin</option><option value="owner">Owner</option></select></div>
+      <button type="submit" class="btn btn-green">➕ Créer</button>
+    </div>
+  </form>
+</div>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Username</th><th>Rôle</th><th>Créé le</th><th>Créé par</th><th></th></tr></thead>
+  <tbody>{rows}</tbody>
+</table></div>"""
+    return _layout("Équipe / Admins", "/admin/owners", content, admin_user, admin_role)
+
+
+def _page_profile(msg, admin_user, admin_role):
+    content = f"""
+{f'<div class="alert {"alert-green" if "✅" in msg else "alert-red"}">{msg}</div>' if msg else ''}
+<div style="max-width:420px">
+<div class="card">
+  <div class="card-title">🔐 Changer mon mot de passe</div>
+  <form method="POST">
+    <div class="form-group"><label>Ancien MDP</label><input name="old_password" type="password"></div>
+    <div class="form-group"><label>Nouveau MDP (6 min)</label><input name="new_password" type="password" minlength="6"></div>
+    <button type="submit" class="btn btn-green">🔐 Changer</button>
+  </form>
+</div>
+</div>"""
+    return _layout("Mon compte", "/admin/profile", content, admin_user, admin_role)
+
+
+def _page_anti_leak(alerts, admin_user, admin_role):
+    rows = ""
+    for a in alerts:
+        rows += f'<tr><td style="font-size:11px;color:var(--muted)">{fmt_ts_rel(a["ts"])}</td><td><a href="/admin/user/{a["username"]}"><b style="color:var(--blue)">{a["username"]}</b></a></td><td style="font-family:monospace;font-size:11px">{(a["hwid"] or "")[:24]}…</td><td style="font-size:12px;color:var(--text2)">{a["ip"] or "—"}</td><td style="color:var(--red);font-size:12px">{a["note"]}</td><td><a href="/admin/ips?prefill={a['ip'] or ''}" class="btn btn-red btn-xs">Ban IP</a></td></tr>'
+    content = f"""
+<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
+  <div class="stat-card"><div class="stat-icon">🛡</div><div class="stat-num" style="color:var(--red)">{len(alerts)}</div><div class="stat-label">Alertes (24h)</div></div>
+  <div class="stat-card"><div class="stat-icon">🔍</div><div class="stat-num" style="color:var(--yellow)">{len(set(a['username'] for a in alerts))}</div><div class="stat-label">Users concernés</div></div>
+  <div class="stat-card"><div class="stat-icon">🌐</div><div class="stat-num" style="color:var(--orange)">{len(set(a['ip'] for a in alerts if a['ip']))}</div><div class="stat-label">IPs uniques</div></div>
+</div>
+<div class="card">
+  <div class="card-title">ℹ️ Détections</div>
+  <ul style="color:var(--text2);font-size:13px;line-height:2;padding-left:14px">
+    <li><b style="color:var(--text)">HWID partagé</b> : même machine sur plusieurs comptes → partage de compte</li>
+    <li><b style="color:var(--text)">IP farm</b> : même IP sur +3 comptes → création en masse</li>
+    <li><b style="color:var(--text)">HWID mismatch</b> : login refusé si machine différente du HWID enregistré</li>
+  </ul>
+</div>
+<div class="tbl-wrap"><table>
+  <thead><tr><th>Quand</th><th>Username</th><th>HWID</th><th>IP</th><th>Alerte</th><th>Action</th></tr></thead>
+  <tbody>{rows or '<tr><td colspan="6" style="text-align:center;padding:24px;color:var(--muted)">Aucune alerte 🎉</td></tr>'}</tbody>
+</table></div>"""
+    return _layout("Anti-Crack / Anti-Leak", "/admin/anti-leak", content, admin_user, admin_role)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SYSTÈME DE MISE À JOUR LOGICIEL
+# ════════════════════════════════════════════════════════════════════════════════
+
+UPDATE_DIR       = "updates"
+UPDATE_META_FILE = os.path.join(UPDATE_DIR, "meta.json")
+UPDATE_HISTORY   = os.path.join(UPDATE_DIR, "history.json")
+UPDATE_MAX_SIZE  = 200 * 1024 * 1024  # 200 Mo max
+
+def _ensure_update_dir():
+    os.makedirs(UPDATE_DIR, exist_ok=True)
+
+def _get_update_meta():
+    try:
+        with open(UPDATE_META_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {"version": None, "filename": None,
+                "uploaded_at": None, "uploaded_by": None,
+                "changelog": "", "size_bytes": 0, "sha256": ""}
+
+def _save_update_meta(meta: dict):
+    _ensure_update_dir()
+    with open(UPDATE_META_FILE, "w") as f:
+        json.dump(meta, f, indent=2)
+
+def _get_update_history() -> list:
+    try:
+        with open(UPDATE_HISTORY, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def _append_update_history(meta: dict):
+    _ensure_update_dir()
+    try:
+        hist = _get_update_history()
+        hist = [h for h in hist if h.get("version") != meta.get("version")]
+        hist.insert(0, {k: meta.get(k) for k in
+                        ("version","filename","uploaded_at","uploaded_by","changelog","size_bytes","sha256")})
+        with open(UPDATE_HISTORY, "w") as f:
+            json.dump(hist[:30], f, indent=2)
+    except Exception as e:
+        print(f"[history] {e}")
+
+# ── API : vérification update ─────────────────────────────────────────────────
+@app.route("/api/update/check", methods=["POST"])
+def api_update_check():
+    data           = request.get_json(silent=True) or {}
+    client_version = str(data.get("version", "0")).strip()
+    meta           = _get_update_meta()
+    server_version = meta.get("version")
+
+    if not server_version or not meta.get("filename"):
+        return jsonify({"update_available": False})
+
+    def _parse(v):
+        try: return [int(x) for x in str(v).split(".")]
+        except: return [0]
+
+    has_update = _parse(server_version) > _parse(client_version)
+    size_bytes = meta.get("size_bytes") or 0
+    size_mb    = round(size_bytes / 1024 / 1024, 1) if size_bytes else None
+    raw_cl     = meta.get("changelog", "")
+    lines      = [l.strip() for l in raw_cl.splitlines() if l.strip()]
+    changelog_entries = [[f"v{server_version}", "Nouveautés", lines[:20]]] if lines and has_update else []
+
+    return jsonify({
+        "update_available":  has_update,
+        "new_version":       server_version if has_update else None,
+        "changelog":         raw_cl,
+        "changelog_entries": changelog_entries,
+        "size_bytes":        size_bytes if has_update else 0,
+        "size_mb":           size_mb    if has_update else None,
+        "sha256":            meta.get("sha256","") if has_update else "",
+        "download_url":      f"{SITE_URL}/api/update/download" if has_update else None,
+        "released_at":       meta.get("uploaded_at"),
+    })
+
+# ── API : téléchargement direct du .exe ──────────────────────────────────────
+@app.route("/api/update/download")
+def api_update_download():
+    meta     = _get_update_meta()
+    filename = meta.get("filename")
+    if not filename:
+        return jsonify({"error": "Aucune update disponible"}), 404
+    filepath = os.path.join(UPDATE_DIR, filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "Fichier introuvable sur le serveur"}), 404
+
+    file_size   = os.path.getsize(filepath)
+    range_hdr   = request.headers.get("Range")
+    ext         = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    ct          = {"exe": "application/octet-stream", "py": "text/x-python",
+                   "zip": "application/zip"}.get(ext, "application/octet-stream")
+
+    def gen_full():
+        with open(filepath, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk: break
+                yield chunk
+
+    def gen_range(start, end):
+        with open(filepath, "rb") as f:
+            f.seek(start)
+            remaining = end - start + 1
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk: break
+                remaining -= len(chunk)
+                yield chunk
+
+    if range_hdr:
+        try:
+            rng   = range_hdr.replace("bytes=", "")
+            parts = rng.split("-")
+            start = int(parts[0])
+            end   = int(parts[1]) if parts[1] else file_size - 1
+            end   = min(end, file_size - 1)
+            return Response(gen_range(start, end), status=206, headers={
+                "Content-Range":       f"bytes {start}-{end}/{file_size}",
+                "Accept-Ranges":       "bytes",
+                "Content-Length":      str(end - start + 1),
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Type":        ct, "Cache-Control": "no-store",
+            }, direct_passthrough=True)
+        except Exception:
+            pass
+
+    return Response(gen_full(), status=200, headers={
+        "Content-Length":      str(file_size),
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Type":        ct,
+        "Accept-Ranges":       "bytes",
+        "Cache-Control":       "no-store",
+    }, direct_passthrough=True)
+
+# ── API : upload AJAX du fichier ──────────────────────────────────────────────
+@app.route("/admin/update/upload_file", methods=["POST"])
+@admin_required
+def admin_update_upload_file():
+    if "file" not in request.files:
+        return jsonify({"success": False, "msg": "Aucun fichier reçu"})
+    f         = request.files["file"]
+    version   = request.form.get("version", "").strip()
+    changelog = request.form.get("changelog", "").strip()
+    if not f or not f.filename:
+        return jsonify({"success": False, "msg": "Fichier invalide"})
+    if not version:
+        return jsonify({"success": False, "msg": "Version requise"})
+    ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+    if ext not in {"exe", "py", "zip"}:
+        return jsonify({"success": False, "msg": f"Extension .{ext} non autorisée (.exe .py .zip)"})
+    data = f.read()
+    size = len(data)
+    if size == 0:
+        return jsonify({"success": False, "msg": "Fichier vide"})
+    if size > UPDATE_MAX_SIZE:
+        return jsonify({"success": False, "msg": f"Fichier trop volumineux ({size//1024//1024} Mo > 200 Mo)"})
+
+    _ensure_update_dir()
+    sha256    = hashlib.sha256(data).hexdigest()
+    safe_name = f"WinOptimizer_v{version.replace(' ','_')}.{ext}"
+    filepath  = os.path.join(UPDATE_DIR, safe_name)
+
+    # Supprime l'ancien fichier si différent
+    old = _get_update_meta()
+    if old.get("filename") and old["filename"] != safe_name:
+        try:
+            old_path = os.path.join(UPDATE_DIR, old["filename"])
+            if os.path.exists(old_path):
+                os.remove(old_path)
+        except Exception:
+            pass
+
+    with open(filepath, "wb") as fout:
+        fout.write(data)
+
+    meta = {"version": version, "filename": safe_name,
+            "uploaded_at": int(time.time()), "uploaded_by": session["admin_user"],
+            "changelog": changelog, "size_bytes": size, "sha256": sha256}
+    _save_update_meta(meta)
+    _append_update_history(meta)
+    size_mb = round(size / 1024 / 1024, 1)
+    add_log("OK", "UPDATE",
+            f"Upload v{version} — {safe_name} ({size_mb} Mo) SHA256:{sha256[:16]}…",
+            session["admin_user"])
+    _push_sse({"type": "update_pushed", "version": version, "size_mb": size_mb,
+               "admin": session["admin_user"]})
+    return jsonify({"success": True,
+                    "msg": f"✅ v{version} uploadée ({size_mb} Mo)",
+                    "filename": safe_name, "size_bytes": size,
+                    "size_mb": size_mb, "sha256": sha256})
+
+# ── Panel admin : page mise à jour ───────────────────────────────────────────
+@app.route("/admin/update", methods=["GET", "POST"])
+@admin_required
+def admin_update():
+    msg = ""
+    if request.method == "POST":
+        action = request.form.get("action", "")
+        if action == "delete":
+            meta = _get_update_meta()
+            if meta.get("filename"):
+                try:
+                    fp = os.path.join(UPDATE_DIR, meta["filename"])
+                    if os.path.exists(fp):
+                        os.remove(fp)
+                except Exception:
+                    pass
+            _save_update_meta({"version": None, "filename": None,
+                               "uploaded_at": None, "uploaded_by": None,
+                               "changelog": "", "size_bytes": 0, "sha256": ""})
+            add_log("WARN", "UPDATE", f"Update supprimée par {session['admin_user']}", session["admin_user"])
+            msg = "🗑️ Update supprimée."
+        elif action == "changelog_only":
+            meta = _get_update_meta()
+            if meta.get("version"):
+                meta["changelog"] = request.form.get("changelog", "").strip()
+                _save_update_meta(meta)
+                msg = "✅ Changelog mis à jour."
+    meta    = _get_update_meta()
+    history = _get_update_history()
+    return _page_update(meta, history, msg, session["admin_user"], session["admin_role"])
+
+
+def _page_update(meta, history, msg, admin_user, admin_role):
+    has   = bool(meta.get("filename") and meta.get("version"))
+    sz    = f"{meta.get('size_bytes',0)/1024/1024:.1f} Mo" if has and meta.get("size_bytes") else "—"
+    upat  = fmt_ts(meta.get("uploaded_at")) if has else "—"
+    sha_s = (meta.get("sha256") or "")[:16]
+    cl    = meta.get("changelog","") or ""
+
+    active_block = f"""
+<div class="card card-glow" style="border-color:rgba(0,255,136,.3)">
+  <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+    <span>✅ Update active</span>
+    <span style="font-size:22px;font-weight:900;color:var(--green)">v{meta['version']}</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:14px">
+    <div class="card-sm"><div style="font-size:10px;color:var(--muted)">FICHIER</div><div style="font-size:12px;word-break:break-all">{meta.get('filename','—')}</div></div>
+    <div class="card-sm"><div style="font-size:10px;color:var(--muted)">TAILLE</div><div style="font-weight:700">{sz}</div></div>
+    <div class="card-sm"><div style="font-size:10px;color:var(--muted)">UPLOADÉ</div><div style="font-size:12px">{upat}</div></div>
+    <div class="card-sm"><div style="font-size:10px;color:var(--muted)">PAR</div><div style="font-size:12px">{meta.get('uploaded_by','—')}</div></div>
+    {'<div class="card-sm"><div style="font-size:10px;color:var(--muted)">SHA256</div><div style="font-family:monospace;font-size:10px;color:var(--muted)">'+sha_s+'…</div></div>' if sha_s else ''}
+  </div>
+  {'<div style="background:var(--card2);border-radius:8px;padding:10px;margin-bottom:12px"><div style="font-size:10px;color:var(--muted);margin-bottom:6px">CHANGELOG</div><pre style="font-size:12px;color:var(--text2);white-space:pre-wrap;margin:0;font-family:inherit;line-height:1.7">'+cl+'</pre></div>' if cl else ''}
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <a href="/api/update/download" class="btn btn-sm btn-blue">⬇ Tester le téléchargement</a>
+    <form method="POST" style="display:inline" onsubmit="return confirm('Supprimer le fichier ?')">
+      <input type="hidden" name="action" value="delete">
+      <button type="submit" class="btn btn-sm btn-red">🗑 Supprimer</button>
+    </form>
+    <button onclick="document.getElementById('cl-edit').style.display=document.getElementById('cl-edit').style.display==='none'?'block':'none'" class="btn btn-sm btn-ghost">✏️ Modifier changelog</button>
+  </div>
+  <div id="cl-edit" style="display:none;margin-top:12px">
+    <form method="POST">
+      <input type="hidden" name="action" value="changelog_only">
+      <textarea name="changelog" rows="5" style="width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:13px;resize:vertical;outline:none;font-family:inherit">{cl}</textarea>
+      <button type="submit" class="btn btn-sm btn-green" style="margin-top:8px">💾 Sauvegarder</button>
+    </form>
+  </div>
+</div>""" if has else """
+<div class="card" style="border-color:rgba(255,68,102,.15)">
+  <div style="text-align:center;padding:28px;color:var(--muted)">
+    <div style="font-size:44px;margin-bottom:12px">📭</div>
+    <div style="font-size:15px;font-weight:600;color:var(--text2)">Aucune update publiée</div>
+    <div style="font-size:12px;margin-top:6px">Upload un .exe ci-contre pour activer les mises à jour automatiques</div>
+  </div>
+</div>"""
+
+    def _hist_row(h):
+        ver   = h.get("version","?")
+        dt    = fmt_ts(h.get("uploaded_at")) if h.get("uploaded_at") else "—"
+        sb    = h.get("size_bytes") or 0
+        sz    = f"{sb/1024/1024:.1f} Mo" if sb else "—"
+        cl_ln = (h.get("changelog","") or "").split("\n")[0][:60]
+        by    = h.get("uploaded_by","—")
+        return (f'<tr><td style="font-weight:700;color:var(--green)">v{ver}</td>'
+                f'<td style="font-size:11px">{dt}</td>'
+                f'<td style="font-size:11px">{sz}</td>'
+                f'<td style="font-size:11px;color:var(--text2);max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{cl_ln}</td>'
+                f'<td style="font-size:11px;color:var(--muted)">{by}</td></tr>')
+
+    hist_rows = "".join(_hist_row(h) for h in history[:15])
+    hist_block = f"""
+<div class="card" style="margin-top:14px">
+  <div class="card-title">📜 Historique ({len(history)} versions)</div>
+  {"<div style='overflow-x:auto'><table class='table'><thead><tr><th>Version</th><th>Date</th><th>Taille</th><th>Changelog</th><th>Par</th></tr></thead><tbody>"+hist_rows+"</tbody></table></div>" if history else '<div style="color:var(--muted);text-align:center;padding:16px;font-size:13px">Aucun historique</div>'}
+</div>""" if history else ""
+
+    content = f"""
+{f'<div class="alert {"alert-green" if "✅" in msg else "alert-red"}" style="margin-bottom:16px">{msg}</div>' if msg else ''}
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start">
+
+<div>
+  <div class="card">
+    <div class="card-title">📤 Uploader une nouvelle version</div>
+    <p style="font-size:12px;color:var(--text2);margin-bottom:14px;line-height:1.7">
+      Sélectionne ou glisse ton <b style="color:var(--text)">.exe</b> directement depuis ton PC.<br>
+      Le fichier est hébergé <b style="color:var(--green)">sur ce serveur</b> — aucun GitHub nécessaire.
+    </p>
+    <div id="drop-zone" style="border:2px dashed var(--border);border-radius:12px;padding:32px;text-align:center;cursor:pointer;transition:all .2s;margin-bottom:14px" onclick="document.getElementById('file-input').click()">
+      <div style="font-size:40px;margin-bottom:8px">📦</div>
+      <div id="drop-label" style="font-size:14px;color:var(--text2)">Clique ou glisse ton fichier ici</div>
+      <div id="drop-size" style="font-size:11px;color:var(--muted);margin-top:4px">Max 200 Mo · .exe .py .zip</div>
+    </div>
+    <input type="file" id="file-input" accept=".exe,.py,.zip" style="display:none">
+    <div class="form-group">
+      <label>Version <span style="color:var(--red)">*</span></label>
+      <input id="inp-version" placeholder="ex: 7.2" style="margin-top:4px">
+    </div>
+    <div class="form-group" style="margin-top:10px">
+      <label>Changelog</label>
+      <textarea id="inp-changelog" rows="4" placeholder="✓ Fix bug X&#10;✓ Ajout feature Y&#10;✓ Amélioration Z" style="width:100%;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:13px;resize:vertical;outline:none;font-family:inherit;line-height:1.6;margin-top:4px"></textarea>
+    </div>
+    <div id="upload-progress-wrap" style="display:none;margin-top:12px">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-bottom:4px">
+        <span id="upload-status">Envoi en cours…</span>
+        <span id="upload-pct">0%</span>
+      </div>
+      <div style="background:var(--card2);border-radius:20px;height:8px;overflow:hidden">
+        <div id="upload-bar" style="height:100%;background:linear-gradient(90deg,var(--green),var(--cyan));border-radius:20px;width:0%;transition:width .15s"></div>
+      </div>
+      <div id="upload-speed" style="font-size:10px;color:var(--muted);margin-top:4px"></div>
+    </div>
+    <button id="btn-upload" onclick="doUpload()" class="btn btn-green" style="width:100%;margin-top:12px;height:44px;font-size:14px">
+      ⬆️ Publier la mise à jour
+    </button>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <div class="card-title">🔗 API</div>
+    <div style="font-size:12px;color:var(--text2);line-height:2.4">
+      <div style="display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid var(--border)">
+        <code style="color:var(--green)">POST /api/update/check</code><span>Vérifier si update dispo</span>
+      </div>
+      <div style="display:flex;justify-content:space-between;padding:4px 0">
+        <code style="color:var(--blue)">GET /api/update/download</code><span>Télécharger le .exe</span>
+      </div>
+    </div>
+    <div style="margin-top:10px;background:var(--card2);border-radius:8px;padding:10px;font-size:11px">
+      <b style="color:var(--text)">Payload check :</b> <code style="color:var(--green)">{{"version": "7.0"}}</code>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:var(--muted);line-height:1.7">
+      ✅ Hébergement direct sur le serveur<br>
+      ✅ Requêtes Range (reprise si coupure)<br>
+      ✅ SHA256 vérifié automatiquement
+    </div>
+  </div>
+</div>
+
+<div>
+  {active_block}
+  {hist_block}
+</div>
+</div>
+
+<script>
+(function(){{
+  var dropZone=document.getElementById('drop-zone');
+  var fileInput=document.getElementById('file-input');
+  var selectedFile=null;
+  dropZone.addEventListener('dragover',function(e){{e.preventDefault();dropZone.style.borderColor='var(--green)';dropZone.style.background='rgba(0,255,136,.05)';}});
+  dropZone.addEventListener('dragleave',function(){{dropZone.style.borderColor='var(--border)';dropZone.style.background='';}});
+  dropZone.addEventListener('drop',function(e){{e.preventDefault();dropZone.style.borderColor='var(--border)';dropZone.style.background='';if(e.dataTransfer.files[0])setFile(e.dataTransfer.files[0]);}});
+  fileInput.addEventListener('change',function(){{if(fileInput.files[0])setFile(fileInput.files[0]);}});
+  function setFile(f){{
+    selectedFile=f;
+    var sz=(f.size/1024/1024).toFixed(1);
+    document.getElementById('drop-label').textContent='✅ '+f.name;
+    document.getElementById('drop-size').textContent=sz+' Mo sélectionné';
+    dropZone.style.borderColor='var(--green)';
+  }}
+  window.doUpload=function(){{
+    if(!selectedFile){{alert('Sélectionne un fichier .exe d\\'abord.');return;}}
+    var version=document.getElementById('inp-version').value.trim();
+    var changelog=document.getElementById('inp-changelog').value.trim();
+    if(!version){{alert('Entre un numéro de version (ex: 7.2)');return;}}
+    var fd=new FormData();
+    fd.append('file',selectedFile);
+    fd.append('version',version);
+    fd.append('changelog',changelog);
+    var btn=document.getElementById('btn-upload');
+    var wrap=document.getElementById('upload-progress-wrap');
+    var bar=document.getElementById('upload-bar');
+    var pct=document.getElementById('upload-pct');
+    var status=document.getElementById('upload-status');
+    var speed=document.getElementById('upload-speed');
+    btn.disabled=true;btn.textContent='⟳ Upload en cours…';wrap.style.display='block';
+    var xhr=new XMLHttpRequest();
+    var start=Date.now();
+    xhr.upload.addEventListener('progress',function(e){{
+      if(!e.lengthComputable)return;
+      var p=Math.round(e.loaded/e.total*100);
+      bar.style.width=p+'%';pct.textContent=p+'%';
+      var elapsed=(Date.now()-start)/1000;
+      var spd=elapsed>0?(e.loaded/1024/1024/elapsed).toFixed(1):'?';
+      var eta=elapsed>0&&e.loaded>0?Math.round((e.total-e.loaded)/(e.loaded/elapsed)):'?';
+      status.textContent='Envoi : '+(e.loaded/1024/1024).toFixed(1)+' / '+(e.total/1024/1024).toFixed(1)+' Mo';
+      speed.textContent=spd+' Mo/s · ETA '+eta+'s';
+    }});
+    xhr.onload=function(){{
+      btn.disabled=false;btn.textContent='⬆️ Publier la mise à jour';
+      try{{
+        var resp=JSON.parse(xhr.responseText);
+        if(resp.success){{
+          bar.style.width='100%';status.textContent=resp.msg;pct.textContent='100%';
+          speed.textContent='SHA256 : '+(resp.sha256||'').substring(0,16)+'…';
+          setTimeout(function(){{location.reload();}},1800);
+        }}else{{
+          status.textContent='❌ '+(resp.msg||'Erreur serveur');
+          bar.style.background='var(--red)';
+          pct.textContent='';
+        }}
+      }}catch(e){{
+        var code=xhr.status;
+        var msgs={{413:'Fichier trop volumineux (max 250 Mo)',500:'Erreur serveur interne',403:'Accès refusé',0:'Pas de réponse'}};
+        status.textContent='❌ '+(msgs[code]||'Erreur HTTP '+code);
+        bar.style.background='var(--red)';
+        pct.textContent=code||'';
+      }}
+    }};
+    xhr.onerror=function(){{btn.disabled=false;btn.textContent='⬆️ Publier la mise à jour';status.textContent='❌ Erreur réseau';bar.style.background='var(--red)';}};
+    xhr.open('POST','/admin/update/upload_file');
+    xhr.send(fd);
+  }};
+}})();
+</script>
+"""
+    return _layout("🔄 Mises à jour", "/admin/update", content, admin_user, admin_role)
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SITE GRAND PUBLIC + ESPACE CLIENT + SHOP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _send_email(to_email: str, subject: str, html_body: str):
+    """Envoie un email via Brevo SMTP (300/jour gratuits)."""
+    brevo_user = os.environ.get("SMTP_USER", "")
+    brevo_pass = os.environ.get("SMTP_PASS", "")
+    brevo_from = os.environ.get("SMTP_FROM", "WinOptimizer Pro <a4abee001@smtp-brevo.com>")
+
+    if not brevo_user or not brevo_pass:
+        print(f"[EMAIL] SMTP non configuré — SMTP_USER={repr(brevo_user)}")
+        return False
+
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = brevo_from
+        msg["To"]      = to_email
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP("smtp-relay.brevo.com", 587, timeout=15) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(brevo_user, brevo_pass)
+            s.sendmail(brevo_from, [to_email], msg.as_string())
+
+        print(f"[EMAIL OK] Brevo → {to_email}")
+        return True
+
+    except smtplib.SMTPAuthenticationError:
+        print("[EMAIL ERROR] Authentification Brevo échouée — vérifie SMTP_USER et SMTP_PASS")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"[EMAIL ERROR] SMTP Brevo : {e}")
+        return False
+    except Exception as e:
+        print(f"[EMAIL ERROR] {e}")
+        return False
+
+def _gen_order_id() -> str:
+    return "WOP-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=10))
+
+def _gen_otp() -> str:
+    return "".join(random.choices(string.digits, k=6))
+
+def _gen_client_password() -> str:
+    chars = string.ascii_letters + string.digits + "!@#$"
+    return "".join(random.choices(chars, k=10))
+
+def init_shop_db():
+    """Tables supplémentaires pour le shop."""
+    conn = get_db()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS shop_orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id TEXT UNIQUE NOT NULL,
+        email TEXT NOT NULL,
+        plan TEXT NOT NULL,
+        price REAL NOT NULL,
+        status TEXT DEFAULT 'pending',
+        license_key TEXT,
+        username TEXT,
+        discord_id TEXT,
+        ip TEXT,
+        payment_method TEXT,
+        payment_ref TEXT,
+        created_at INTEGER,
+        claimed INTEGER DEFAULT 0,
+        promo_code TEXT,
+        invoice_sent INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS client_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT NOT NULL,
+        otp TEXT NOT NULL,
+        created_at INTEGER,
+        used INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS promo_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT UNIQUE NOT NULL,
+        reduction INTEGER DEFAULT 10,
+        plan TEXT DEFAULT 'ALL',
+        max_uses INTEGER DEFAULT 0,
+        uses INTEGER DEFAULT 0,
+        created_by TEXT,
+        created_at INTEGER,
+        active INTEGER DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS site_settings (
+        key TEXT PRIMARY KEY, value TEXT
+    );
+    CREATE TABLE IF NOT EXISTS site_products (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        plan TEXT NOT NULL,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        description TEXT,
+        features TEXT,
+        badge TEXT,
+        active INTEGER DEFAULT 1,
+        sort_order INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS site_faq (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        question TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        category TEXT DEFAULT 'general',
+        sort_order INTEGER DEFAULT 0,
+        active INTEGER DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS site_testimonials (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        author TEXT NOT NULL,
+        content TEXT NOT NULL,
+        rating INTEGER DEFAULT 5,
+        game TEXT,
+        avatar TEXT,
+        active INTEGER DEFAULT 1,
+        created_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS chatbot_qa (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        keywords TEXT NOT NULL,
+        response TEXT NOT NULL,
+        category TEXT DEFAULT 'general',
+        active INTEGER DEFAULT 1,
+        hits INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS chatbot_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        ip TEXT,
+        message TEXT,
+        response TEXT,
+        ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS site_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        page TEXT,
+        ip TEXT,
+        country TEXT,
+        city TEXT,
+        flag TEXT,
+        isp TEXT,
+        is_proxy INTEGER DEFAULT 0,
+        user_agent TEXT,
+        referrer TEXT,
+        ts INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS site_announcements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message TEXT NOT NULL,
+        color TEXT DEFAULT 'blue',
+        active INTEGER DEFAULT 1,
+        created_at INTEGER,
+        expires_at INTEGER
+    );
+    """)
+    # Default site settings
+    for k, v in [
+        ("exe_url_normal", ""),
+        ("exe_url_pro", ""),
+        ("stock_normal", "999"),
+        ("stock_pro", "999"),
+        ("product_normal_active", "1"),
+        ("product_pro_active", "1"),
+        ("discord_invite", DISCORD_INVITE),
+        ("site_maintenance", "0"),
+        ("maintenance_site_msg","Nous revenons très bientôt. Merci de ta patience !"),
+        ("site_title", "WinOptimizer Pro"),
+        ("site_tagline", "Optimise ton Windows pour des FPS max"),
+        ("site_description", "Le logiciel d'optimisation Windows le plus avancé pour les gamers. +97 tweaks système, gaming et réseau."),
+        ("hero_badge", "⚡ +5000 utilisateurs satisfaits"),
+        ("stat1_val", "+97"), ("stat1_label", "Optimisations"),
+        ("stat2_val", "+25"), ("stat2_label", "Jeux supportés"),
+        ("stat3_val", "-30ms"), ("stat3_label", "Latence réseau"),
+        ("stat4_val", "+15%"), ("stat4_label", "FPS moyens"),
+        ("price_normal", "4.99"),
+        ("price_pro", "9.99"),
+        ("chatbot_enabled", "1"),
+        ("chatbot_name", "OptBot"),
+        ("chatbot_avatar", "🤖"),
+        ("chatbot_welcome", "Salut ! Je suis OptBot, l'assistant de WinOptimizer Pro. Comment puis-je t'aider ? 😊"),
+        ("reviews_enabled", "1"),
+        ("faq_enabled", "1"),
+        ("announcement_bar", "0"),
+        ("announcement_text", ""),
+        ("announcement_color", "blue"),
+    ]:
+        conn.execute("INSERT OR IGNORE INTO site_settings VALUES (?,?)", (k, v))
+
+    # Default products if empty
+    if not conn.execute("SELECT 1 FROM site_products").fetchone():
+        conn.execute("INSERT INTO site_products (plan,name,price,description,features,badge,active,sort_order) VALUES (?,?,?,?,?,?,?,?)",
+            ("NORMAL","NORMAL",4.99,"Toutes les optimisations essentielles pour booster ton PC gaming.",
+             "+50 optimisations|Gaming Pack 25+ jeux|Réseau & confidentialité|Espace client inclus",
+             "","1",1))
+        conn.execute("INSERT INTO site_products (plan,name,price,description,features,badge,active,sort_order) VALUES (?,?,?,?,?,?,?,?)",
+            ("PRO","PRO",9.99,"L'expérience gaming ultime avec toutes les optimisations avancées.",
+             "Tout le plan NORMAL|+47 optimisations avancées|Tweaks CPU HPET Core Parking|Overclock CPU/GPU sécurisé|Presets Ultra & Streamer|6 addons gaming gratuits|Support prioritaire",
+             "⭐ LE PLUS POPULAIRE","1",2))
+
+    # Default FAQ if empty
+    if not conn.execute("SELECT 1 FROM site_faq").fetchone():
+        faqs = [
+            ("C'est quoi WinOptimizer Pro ?", "WinOptimizer Pro est un logiciel d'optimisation Windows conçu pour les gamers. Il applique +97 tweaks système pour booster tes FPS, réduire la latence et améliorer les performances générales.", "general", 1),
+            ("Quelle est la différence entre NORMAL et PRO ?", "Le plan NORMAL inclut les optimisations essentielles (réseau, gaming, confidentialité). Le plan PRO ajoute +47 tweaks avancés, overclock sécurisé, presets Ultra & Streamer et 6 addons gaming gratuits.", "general", 2),
+            ("Comment acheter une licence ?", "Clique sur 'Acheter via Discord' et rejoins notre serveur Discord. Un membre du staff te guidera pour finaliser ton achat rapidement.", "achat", 3),
+            ("La licence est-elle à vie ?", "Oui ! C'est un paiement unique. Tu reçois une licence à vie sans abonnement mensuel.", "achat", 4),
+            ("Windows 11 est-il supporté ?", "Oui, WinOptimizer Pro est compatible avec Windows 10 et Windows 11 (toutes versions).", "technique", 5),
+            ("Est-ce que ça peut causer des problèmes ?", "Non. Tous nos tweaks sont réversibles et testés. Le logiciel crée automatiquement un point de restauration avant d'appliquer des modifications.", "technique", 6),
+            ("Comment réinitialiser mon HWID ?", "Rejoins le Discord et ouvre un ticket de support. L'équipe traitera ta demande sous 24h.", "compte", 7),
+            ("J'ai oublié mon mot de passe ?", "Dans le logiciel, clique sur 'Mot de passe oublié'. Tu peux aussi demander un reset via Discord avec ton Discord ID.", "compte", 8),
+        ]
+        for q, a, cat, order in faqs:
+            conn.execute("INSERT INTO site_faq (question,answer,category,sort_order,active) VALUES (?,?,?,?,1)", (q, a, cat, order))
+
+    # Default testimonials if empty
+    if not conn.execute("SELECT 1 FROM site_testimonials").fetchone():
+        testimonials = [
+            ("NekoGamer_YT", "Franchement incroyable ! +40 FPS sur Valorant après l'optimisation. Je recommande à 100% 🔥", 5, "Valorant", "🎮", int(time.time())-86400*3),
+            ("xXProSniper", "Le plan PRO vaut vraiment le coup. La latence réseau a chuté de 30ms, c'est vraiment perceptible en jeu.", 5, "CS2", "🎯", int(time.time())-86400*7),
+            ("StreamerFR", "J'utilise le preset Streamer et mes drops de FPS ont quasi disparu pendant les streams. Parfait !", 5, "Fortnite", "📺", int(time.time())-86400*12),
+            ("TechReviewer42", "Très bon rapport qualité/prix. L'interface est propre, l'installation simple. Support Discord réactif.", 4, "General", "⭐", int(time.time())-86400*20),
+        ]
+        for author, content, rating, game, avatar, ts in testimonials:
+            conn.execute("INSERT INTO site_testimonials (author,content,rating,game,avatar,active,created_at) VALUES (?,?,?,?,?,1,?)",
+                         (author, content, rating, game, avatar, ts))
+
+    # Default chatbot Q&A if empty
+    if not conn.execute("SELECT 1 FROM chatbot_qa").fetchone():
+        qas = [
+            ("prix tarif coût combien acheter", "Les licences sont disponibles à partir de **4.99€** (paiement unique, à vie) !\n\n🔷 **NORMAL** — 4.99€ : +50 optimisations, Gaming Pack, réseau\n⭐ **PRO** — 9.99€ : tout NORMAL + 47 tweaks avancés, overclock, presets, 6 addons\n\nPour acheter, rejoins notre [Discord](" + DISCORD_INVITE + ") 🎮", "achat"),
+            ("acheter commander payer discord", "Pour acheter WinOptimizer Pro, c'est simple :\n1. Rejoins notre [Discord](" + DISCORD_INVITE + ")\n2. Va dans le canal #shop\n3. Un membre du staff te guidera pour finaliser ton achat\n\nPayment accepté : PayPal, carte bancaire 💳", "achat"),
+            ("différence normal pro", "🔷 **Plan NORMAL (4.99€)** :\n• +50 optimisations essentielles\n• Gaming Pack 25+ jeux\n• Optimisations réseau & confidentialité\n• Espace client inclus\n\n⭐ **Plan PRO (9.99€)** :\n• Tout le plan NORMAL\n• +47 tweaks CPU/GPU avancés\n• HPET & Core Parking off\n• Overclock CPU/GPU sécurisé\n• Presets Ultra Performance & Streamer\n• 6 addons gaming gratuits\n• Support prioritaire Discord", "produit"),
+            ("windows compatible version", "WinOptimizer Pro est compatible avec :\n✅ Windows 10 (toutes versions)\n✅ Windows 11 (toutes versions)\n\nLes optimisations sont adaptées automatiquement selon ta version Windows 🖥️", "technique"),
+            ("fps latence amélioration résultat", "En moyenne, nos utilisateurs constatent :\n📈 **+15% à +40% de FPS** selon le matériel\n📡 **-30ms de latence réseau** grâce aux tweaks TCP\n⚡ **Boot Windows 2x plus rapide**\n🎮 **Micro-stutters réduits de 80%**\n\nLes résultats varient selon ta config, mais la majorité des utilisateurs voient une amélioration significative !", "produit"),
+            ("problème sécurité risque dangereux", "WinOptimizer Pro est 100% sécurisé :\n🛡️ Aucun malware, testé sur VirusTotal\n🔄 **Point de restauration automatique** avant chaque optimisation\n↩️ Tous les tweaks sont **réversibles en 1 clic**\n🔒 Aucune donnée personnelle collectée\n\nTu peux annuler n'importe quelle optimisation à tout moment.", "securite"),
+            ("hwid reset machine pc", "Pour réinitialiser ton HWID (si tu changes de PC) :\n1. Rejoins notre [Discord](" + DISCORD_INVITE + ")\n2. Ouvre un ticket dans #support\n3. Fournis ton username et ton Discord ID\n\n⏱️ Traitement sous **24h** par le staff !", "compte"),
+            ("mot de passe oublié compte perdu", "Si tu as oublié ton mot de passe :\n1. Ouvre le logiciel → clique **'Mot de passe oublié'**\n2. Entre ton Discord ID pour vérification\n3. Ou contacte le support sur notre [Discord](" + DISCORD_INVITE + ")\n\nTon compte sera récupéré rapidement 🔑", "compte"),
+            ("remboursement refund", "Notre politique de remboursement :\n✅ Remboursement possible dans les **24h** si le logiciel ne fonctionne pas sur ta machine\n❌ Pas de remboursement si les optimisations ont été appliquées\n\nContacte le support sur [Discord](" + DISCORD_INVITE + ") pour toute demande.", "achat"),
+            ("discord serveur communauté support", "Rejoins notre communauté Discord !\n\n🎮 **+500 membres** actifs\n🛠️ **Support prioritaire** pour les clients PRO\n📢 Annonces exclusives et mises à jour\n🎁 Codes promo réservés aux membres\n\n👉 [Cliquer ici pour rejoindre](" + DISCORD_INVITE + ")", "communaute"),
+            ("bonjour salut hello hi", "Salut ! 👋 Je suis **OptBot**, l'assistant de WinOptimizer Pro.\n\nJe peux t'aider avec :\n• 💰 Les tarifs et comment acheter\n• ⚡ Les performances et résultats\n• 🛠️ Les questions techniques\n• 👤 Ton compte et accès\n• 💬 Le support Discord\n\nQuelle est ta question ?", "general"),
+            ("merci ok super parfait", "Avec plaisir ! 😊 Si tu as d'autres questions, n'hésite pas.\n\nTu peux aussi nous rejoindre sur [Discord](" + DISCORD_INVITE + ") pour discuter avec la communauté et l'équipe ! 🎮", "general"),
+        ]
+        for keywords, response, category in qas:
+            conn.execute("INSERT INTO chatbot_qa (keywords,response,category,active,hits) VALUES (?,?,?,1,0)", (keywords, response, category))
+
+    conn.commit()
+    conn.close()
+
+def get_site_setting(key: str, default: str = "") -> str:
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM site_settings WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+def track_visit(page: str):
+    """Enregistre une visite sur le site public avec GeoIP IPv4 complet."""
+    try:
+        ip = get_real_ip()
+        geo = get_geoip(ip)
+        ua = request.headers.get("User-Agent","")[:200]
+        ref = request.headers.get("Referer","")[:200]
+        conn = get_db()
+        conn.execute(
+            "INSERT INTO site_stats (page,ip,country,city,flag,isp,is_proxy,user_agent,referrer,ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (page, ip, geo.get("country","?"), geo.get("city","?"), geo.get("flag","🌐"),
+             geo.get("isp","?"), 1 if geo.get("proxy") else 0, ua, ref, int(time.time()))
+        )
+        conn.commit(); conn.close()
+    except Exception:
+        pass  # Ne jamais faire planter le site à cause du tracking
+
+def set_site_setting(key: str, value: str):
+    import sqlite3 as _sq3
+    # Retry loop pour éviter "database is locked" sur Render
+    for _attempt in range(5):
+        try:
+            conn = get_db()
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("INSERT OR REPLACE INTO site_settings VALUES (?,?)", (key, value))
+            conn.commit()
+            conn.close()
+            return
+        except _sq3.OperationalError as _e:
+            if "locked" in str(_e) and _attempt < 4:
+                import time as _t; _t.sleep(0.2 * (_attempt + 1))
+            else:
+                conn.close()
+                raise
+
+def _invoice_html(order: dict) -> str:
+    date = datetime.fromtimestamp(order.get("created_at", time.time())).strftime("%d/%m/%Y %H:%M")
+    plan_label = "⭐ PRO" if order.get("plan") == "PRO" else "🔷 NORMAL"
+    return f"""
+<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#0d0d0f;color:#fff;margin:0;padding:20px">
+<div style="max-width:600px;margin:auto;background:#1a1a1f;border-radius:12px;border:1px solid #2a2a3a;overflow:hidden">
+  <div style="background:linear-gradient(135deg,#4f8ef7,#7c5cbf);padding:32px;text-align:center">
+    <div style="font-size:32px;font-weight:900;letter-spacing:2px">⚡ WinOptimizer Pro</div>
+    <div style="opacity:.8;margin-top:6px">Facture de commande</div>
+  </div>
+  <div style="padding:32px">
+    <table style="width:100%;border-collapse:collapse">
+      <tr><td style="color:#888;padding:8px 0">N° Commande</td><td style="text-align:right;font-weight:700;color:#4f8ef7">#{order.get('order_id','?')}</td></tr>
+      <tr><td style="color:#888;padding:8px 0">Date</td><td style="text-align:right">{date}</td></tr>
+      <tr><td style="color:#888;padding:8px 0">Email</td><td style="text-align:right">{order.get('email','?')}</td></tr>
+      <tr><td style="color:#888;padding:8px 0">Plan</td><td style="text-align:right;font-weight:700">{plan_label}</td></tr>
+      <tr style="border-top:1px solid #2a2a3a"><td style="padding:16px 0;font-size:18px;font-weight:700">Total payé</td><td style="text-align:right;font-size:20px;font-weight:900;color:#00ff88">{order.get('price','?')}€</td></tr>
+    </table>
+    <div style="background:#0d0d0f;border-radius:8px;padding:16px;margin-top:16px">
+      <div style="color:#888;margin-bottom:8px">Clé de licence</div>
+      <div style="font-family:monospace;font-size:15px;color:#4f8ef7;letter-spacing:2px">{order.get('license_key','—')}</div>
+    </div>
+    <div style="margin-top:24px;text-align:center;color:#888;font-size:13px">
+      Connecte-toi à <a href="{SITE_URL}/client" style="color:#4f8ef7">ton espace client</a> pour télécharger le logiciel.<br>
+      Support : <a href="{DISCORD_INVITE}" style="color:#4f8ef7">discord.gg/8fvBAJXHU3</a>
+    </div>
+  </div>
+</div></body></html>"""
+
+def _welcome_email(email: str, username: str, password: str, plan: str, license_key: str, order_id: str) -> str:
+    return f"""
+<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#0d0d0f;color:#fff;margin:0;padding:20px">
+<div style="max-width:600px;margin:auto;background:#1a1a1f;border-radius:12px;border:1px solid #2a2a3a;overflow:hidden">
+  <div style="background:linear-gradient(135deg,#4f8ef7,#7c5cbf);padding:32px;text-align:center">
+    <div style="font-size:32px;font-weight:900">⚡ WinOptimizer Pro</div>
+    <div style="opacity:.8;margin-top:6px">Bienvenue dans WinOptimizer Pro !</div>
+  </div>
+  <div style="padding:32px">
+    <p>Merci pour ton achat ! Voici tes identifiants :</p>
+    <div style="background:#0d0d0f;border-radius:8px;padding:16px;margin:16px 0">
+      <div style="margin-bottom:8px">👤 <b>Username :</b> <span style="color:#4f8ef7">{username}</span></div>
+      <div style="margin-bottom:8px">🔑 <b>Mot de passe :</b> <span style="color:#4f8ef7">{password}</span></div>
+      <div style="margin-bottom:8px">🎫 <b>Licence :</b> <span style="font-family:monospace;color:#00ff88">{license_key}</span></div>
+      <div>📦 <b>Plan :</b> {'⭐ PRO' if plan == 'PRO' else '🔷 NORMAL'}</div>
+    </div>
+    <p>Commande : <b>#{order_id}</b></p>
+    <div style="text-align:center;margin-top:24px">
+      <a href="{SITE_URL}/client" style="background:#4f8ef7;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-weight:700">Télécharger le logiciel</a>
+    </div>
+    <p style="margin-top:24px;color:#888;font-size:13px;text-align:center">
+      Change ton mot de passe à la première connexion.<br>
+      Support : <a href="{DISCORD_INVITE}" style="color:#4f8ef7">Discord</a>
+    </p>
+  </div>
+</div></body></html>"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SITE PUBLIC — Page d'accueil
+# ─────────────────────────────────────────────────────────────────────────────
+SITE_CSS = """
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{--bg:#0d0d0f;--card:#1a1a1f;--card2:#1f1f26;--border:#2a2a3a;
+  --text:#e8e8f0;--text2:#8888aa;--accent:#4f8ef7;--green:#00ff88;--red:#ff4466;
+  --gold:#ffd700;--purple:#7c5cbf;--muted:#444458;--nav-h:60px}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;overflow-x:hidden}
+a{text-decoration:none;color:inherit}
+img{max-width:100%}
+
+/* ── NAV ── */
+.nav{background:rgba(13,13,15,.97);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:200;padding:0 4%}
+.nav-inner{display:flex;align-items:center;justify-content:space-between;height:var(--nav-h);gap:12px}
+.logo{font-size:18px;font-weight:900;background:linear-gradient(135deg,var(--accent),var(--purple));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;white-space:nowrap}
+.nav-links{display:flex;gap:24px;align-items:center}
+.nav-links a{color:var(--text2);font-size:14px;font-weight:500;transition:.2s;white-space:nowrap}
+.nav-links a:hover{color:var(--text)}
+.nav-actions{display:flex;gap:8px;align-items:center;flex-shrink:0}
+/* Hamburger mobile */
+.nav-burger{display:none;flex-direction:column;gap:5px;cursor:pointer;padding:8px;border:none;background:none;color:var(--text)}
+.nav-burger span{display:block;width:22px;height:2px;background:currentColor;border-radius:2px;transition:.3s}
+.nav-mobile{display:none;position:fixed;top:var(--nav-h);left:0;right:0;background:rgba(13,13,15,.99);
+  border-bottom:1px solid var(--border);padding:16px 5%;z-index:199;flex-direction:column;gap:4px}
+.nav-mobile.open{display:flex}
+.nav-mobile a{padding:12px 0;color:var(--text2);font-size:16px;font-weight:500;border-bottom:1px solid var(--border)}
+.nav-mobile a:last-child{border:none}
+.nav-mobile .nav-m-btns{display:flex;gap:10px;padding-top:12px;flex-wrap:wrap}
+
+/* ── BUTTONS ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  padding:10px 24px;border-radius:8px;font-weight:700;font-size:14px;
+  cursor:pointer;transition:.2s;border:none;white-space:nowrap}
+.btn-primary{background:linear-gradient(135deg,var(--accent),var(--purple));color:#fff}
+.btn-primary:hover{opacity:.88;transform:translateY(-1px);box-shadow:0 4px 20px rgba(79,142,247,.4)}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--text2)}
+.btn-outline:hover{border-color:var(--accent);color:var(--text)}
+.btn-sm{padding:7px 16px;font-size:13px}
+
+/* ── HERO ── */
+.hero{padding:clamp(48px,8vw,96px) 5% clamp(36px,6vw,72px);text-align:center}
+.hero h1{font-size:clamp(28px,5.5vw,64px);font-weight:900;line-height:1.1;margin-bottom:18px}
+.hero h1 span{background:linear-gradient(135deg,var(--accent),var(--purple));
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero p{font-size:clamp(15px,2vw,18px);color:var(--text2);max-width:600px;margin:0 auto 32px;line-height:1.7}
+.hero-btns{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+
+/* ── SECTIONS ── */
+.section{padding:clamp(40px,6vw,72px) 5%}
+.section-title{font-size:clamp(20px,3.5vw,36px);font-weight:800;text-align:center;margin-bottom:10px}
+.section-sub{color:var(--text2);text-align:center;margin-bottom:clamp(28px,4vw,48px);font-size:clamp(14px,1.8vw,16px);line-height:1.6}
+
+/* ── GRIDS ── */
+.grid-3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+.grid-2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px}
+
+/* ── CARDS ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:24px;transition:.2s}
+.card:hover{border-color:rgba(79,142,247,.4);transform:translateY(-2px)}
+.feat-icon{font-size:32px;margin-bottom:14px}
+.feat-title{font-size:15px;font-weight:700;margin-bottom:8px}
+.feat-desc{font-size:13px;color:var(--text2);line-height:1.6}
+
+/* ── PLAN CARDS ── */
+.plan-card{background:var(--card);border:2px solid var(--border);border-radius:18px;
+  padding:clamp(24px,4vw,36px);text-align:center;transition:.3s;position:relative}
+.plan-card.popular{border-color:var(--accent);background:linear-gradient(180deg,rgba(79,142,247,.07),var(--card))}
+.plan-badge{position:absolute;top:-14px;left:50%;transform:translateX(-50%);
+  background:linear-gradient(135deg,var(--accent),var(--purple));color:#fff;
+  padding:4px 16px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap}
+.plan-name{font-size:22px;font-weight:800;margin-bottom:8px}
+.plan-price{font-size:clamp(36px,7vw,52px);font-weight:900;color:var(--accent);margin:14px 0}
+.plan-price sup{font-size:18px;vertical-align:top;margin-top:10px;display:inline-block}
+.plan-features{list-style:none;text-align:left;margin:20px 0;display:flex;flex-direction:column;gap:10px}
+.plan-features li{display:flex;align-items:flex-start;gap:10px;font-size:14px;color:var(--text2);line-height:1.4}
+.plan-features li .chk{color:var(--green);font-size:15px;flex-shrink:0;margin-top:1px}
+.plan-features li .x{color:var(--red);flex-shrink:0}
+
+/* ── TABLE ── */
+.diff-table{width:100%;border-collapse:collapse;font-size:14px}
+.diff-table th{background:var(--card2);padding:12px 14px;text-align:left;border-bottom:2px solid var(--border);font-size:13px}
+.diff-table td{padding:11px 14px;border-bottom:1px solid var(--border)}
+.diff-table tr:hover td{background:rgba(79,142,247,.04)}
+.badge-yes{color:var(--green);font-weight:700}
+.badge-no{color:var(--muted)}
+
+/* ── FORMS ── */
+.form-group{margin-bottom:14px}
+.form-group label{display:block;font-size:13px;color:var(--text2);margin-bottom:5px}
+.form-group input,.form-group select{width:100%;background:var(--card2);border:1px solid var(--border);
+  border-radius:8px;padding:11px 14px;color:var(--text);font-size:14px;outline:none;-webkit-appearance:none}
+.form-group input:focus,.form-group select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,142,247,.12)}
+.msg-ok{background:rgba(0,255,136,.1);border:1px solid rgba(0,255,136,.3);color:var(--green);
+  border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:14px}
+.msg-err{background:rgba(255,68,102,.1);border:1px solid rgba(255,68,102,.3);color:var(--red);
+  border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:14px}
+
+/* ── FOOTER ── */
+footer{background:var(--card);border-top:1px solid var(--border);padding:clamp(28px,5vw,48px) 5%;
+  display:flex;flex-direction:column;align-items:center;gap:14px;text-align:center}
+footer .links{display:flex;gap:20px;flex-wrap:wrap;justify-content:center}
+footer .links a{color:var(--text2);font-size:13px;transition:.2s}
+footer .links a:hover{color:var(--text)}
+
+/* ── MODAL ── */
+.modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:300;
+  align-items:center;justify-content:center;padding:16px;overflow-y:auto}
+.modal-bg.open{display:flex}
+.modal{background:var(--card);border:1px solid var(--border);border-radius:18px;
+  padding:clamp(20px,4vw,36px);width:100%;max-width:480px;max-height:90vh;overflow-y:auto}
+.modal h2{font-size:20px;font-weight:800;margin-bottom:18px}
+
+/* ── STATS BAR ── */
+.stats-bar{display:flex;justify-content:center;gap:clamp(20px,5vw,56px);flex-wrap:wrap;padding:16px 0}
+.stat-item{text-align:center;min-width:80px}
+.stat-num{font-size:clamp(26px,5vw,38px);font-weight:900;line-height:1}
+.stat-lbl{color:var(--text2);font-size:13px;margin-top:4px}
+
+/* ── CHATBOT mobile ── */
+@media(max-width:500px){
+  #chatbot-widget{width:calc(100vw - 24px)!important;right:12px!important;bottom:80px!important}
+  #chatbot-btn{right:12px!important;bottom:16px!important;width:50px!important;height:50px!important}
+}
+
+/* ══ RESPONSIVE ══ */
+@media(max-width:768px){
+  .nav-links,.nav-actions .btn-outline{display:none}
+  .nav-burger{display:flex}
+  .hero{padding:40px 4% 32px}
+  .hero-btns .btn{width:100%;max-width:320px}
+  .section{padding:36px 4%}
+  .card{padding:18px}
+  .plan-card{padding:24px 18px}
+  .grid-2,.grid-3{grid-template-columns:1fr}
+  .diff-table{font-size:12px}
+  .diff-table th,.diff-table td{padding:8px 10px}
+  footer{padding:24px 5%}
+  footer .links{gap:14px}
+  .stats-bar{gap:20px}
+}
+@media(max-width:480px){
+  .nav{padding:0 3%}
+  .logo{font-size:16px}
+  .btn{padding:9px 18px;font-size:13px}
+  .section-sub{margin-bottom:24px}
+  .plan-card{margin-bottom:8px}
+}
+</style>
+<script>
+// Nav hamburger
+function toggleMobileNav(){{
+  document.getElementById('nav-mobile').classList.toggle('open');
+}}
+document.addEventListener('click',function(e){{
+  var mob=document.getElementById('nav-mobile');
+  var burger=document.getElementById('nav-burger-btn');
+  if(mob&&burger&&!mob.contains(e.target)&&!burger.contains(e.target)){{
+    mob.classList.remove('open');
+  }}
+}});
+</script>
+"""
+
+def _site_nav(active="home"):
+    site_title = get_site_setting("site_title", "WinOptimizer Pro")
+    links = [
+        ("Accueil",        "/",         "home"),
+        ("Fonctionnalités","/features", "features"),
+        ("Tarifs",         "/pricing",  "pricing"),
+        ("Espace Client",  "/client",   "client"),
+    ]
+    items = ""
+    mobile_items = ""
+    for label, href, key in links:
+        active_style = "color:var(--text);font-weight:700" if active == key else ""
+        items += f'<a href="{href}" style="{active_style}">{label}</a>'
+        mobile_items += f'<a href="{href}">{label}</a>'
+    discord = get_site_setting("discord_invite", DISCORD_INVITE)
+    return f"""
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="/" class="logo">⚡ {site_title}</a>
+    <div class="nav-links">{items}</div>
+    <div class="nav-actions">
+      <a href="/client" class="btn btn-outline btn-sm">Connexion</a>
+      <a href="/pricing" class="btn btn-primary btn-sm">Acheter</a>
+    </div>
+    <button class="nav-burger" id="nav-burger-btn" onclick="toggleMobileNav()" aria-label="Menu">
+      <span></span><span></span><span></span>
+    </button>
+  </div>
+</nav>
+<div class="nav-mobile" id="nav-mobile">
+  {mobile_items}
+  <div class="nav-m-btns">
+    <a href="/client" class="btn btn-outline btn-sm" style="flex:1">Connexion</a>
+    <a href="/pricing" class="btn btn-primary btn-sm" style="flex:1">Acheter</a>
+  </div>
+</div>"""
+
+def _site_chatbot():
+    """Retourne le widget chatbot si activé — injecté sur toutes les pages publiques."""
+    if get_site_setting("chatbot_enabled","1") != "1":
+        return ""
+    chatbot_name    = get_site_setting("chatbot_name","OptBot")
+    chatbot_av      = get_site_setting("chatbot_avatar","🤖")
+    chatbot_welcome = get_site_setting("chatbot_welcome","Salut ! Comment puis-je t'aider ?")
+    discord_link    = get_site_setting("discord_invite", DISCORD_INVITE)
+    return f"""
+<div id="chatbot-btn" onclick="toggleChat()" style="position:fixed;bottom:24px;right:24px;width:56px;height:56px;
+  background:linear-gradient(135deg,var(--accent),var(--purple));border-radius:50%;display:flex;align-items:center;
+  justify-content:center;cursor:pointer;z-index:999;box-shadow:0 4px 20px rgba(79,142,247,.5);font-size:24px;
+  transition:.3s" title="Ouvrir le chat">{chatbot_av}</div>
+
+<div id="chatbot-notif" style="position:fixed;bottom:84px;right:24px;background:linear-gradient(135deg,var(--accent),var(--purple));
+  color:#fff;padding:8px 14px;border-radius:12px;font-size:13px;font-weight:600;z-index:998;
+  box-shadow:0 4px 16px rgba(79,142,247,.4);animation:bot-pulse 2s infinite;cursor:pointer" onclick="toggleChat()">
+  Besoin d'aide ? 💬</div>
+
+<div id="chatbot-widget" style="display:none;position:fixed;bottom:90px;right:24px;width:360px;
+  background:var(--card);border:1px solid var(--border);border-radius:20px;box-shadow:0 8px 40px rgba(0,0,0,.6);
+  z-index:1000;overflow:hidden;flex-direction:column;max-height:520px">
+  <div style="background:linear-gradient(135deg,var(--accent),var(--purple));padding:16px 20px;display:flex;align-items:center;gap:12px">
+    <div style="font-size:28px">{chatbot_av}</div>
+    <div>
+      <div style="font-weight:800;font-size:15px;color:#fff">{chatbot_name}</div>
+      <div style="font-size:12px;color:rgba(255,255,255,.75)">🟢 En ligne — répond instantanément</div>
+    </div>
+    <div onclick="toggleChat()" style="margin-left:auto;cursor:pointer;color:rgba(255,255,255,.7);font-size:20px">✕</div>
+  </div>
+  <div id="chat-messages" style="padding:16px;overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:10px;max-height:360px">
+    <div class="bot-msg">{chatbot_welcome}</div>
+    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px" id="quick-btns">
+      <button onclick="sendQuick('Prix et tarifs')" class="quick-btn">💰 Tarifs</button>
+      <button onclick="sendQuick('Comment acheter ?')" class="quick-btn">🛒 Acheter</button>
+      <button onclick="sendQuick('Différence NORMAL et PRO')" class="quick-btn">⚡ Plans</button>
+      <button onclick="sendQuick('Windows compatible ?')" class="quick-btn">🖥️ Compat.</button>
+      <button onclick="sendQuick('Support Discord')" class="quick-btn">💬 Discord</button>
+    </div>
+  </div>
+  <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px">
+    <input id="chat-input" placeholder="Tape ta question..." style="flex:1;background:var(--card2);border:1px solid var(--border);
+      border-radius:10px;padding:10px 14px;color:var(--text);font-size:14px;outline:none"
+      onkeydown="if(event.key==='Enter')sendMsg()">
+    <button onclick="sendMsg()" style="background:linear-gradient(135deg,var(--accent),var(--purple));border:none;
+      border-radius:10px;width:40px;height:40px;cursor:pointer;font-size:18px;color:#fff">➤</button>
+  </div>
+</div>
+
+<style>
+.bot-msg{{background:var(--card2);border-radius:12px 12px 12px 4px;padding:10px 14px;font-size:14px;
+  color:var(--text);line-height:1.6;max-width:90%;white-space:pre-wrap}}
+.user-msg{{background:linear-gradient(135deg,var(--accent),var(--purple));border-radius:12px 12px 4px 12px;
+  padding:10px 14px;font-size:14px;color:#fff;line-height:1.6;max-width:90%;align-self:flex-end}}
+.quick-btn{{background:rgba(79,142,247,.12);border:1px solid rgba(79,142,247,.3);color:var(--accent);
+  border-radius:20px;padding:5px 12px;font-size:12px;cursor:pointer;transition:.2s;white-space:nowrap}}
+.quick-btn:hover{{background:rgba(79,142,247,.25)}}
+.bot-typing{{display:flex;gap:4px;align-items:center;padding:12px 16px;background:var(--card2);
+  border-radius:12px;width:60px}}
+.bot-typing span{{width:6px;height:6px;background:var(--text2);border-radius:50%;animation:bot-blink 1s infinite}}
+.bot-typing span:nth-child(2){{animation-delay:.2s}}
+.bot-typing span:nth-child(3){{animation-delay:.4s}}
+@keyframes bot-blink{{0%,80%,100%{{opacity:.2}}40%{{opacity:1}}}}
+@keyframes bot-pulse{{0%,100%{{transform:scale(1)}}50%{{transform:scale(1.04)}}}}
+</style>
+<script>
+(function(){{
+var chatOpen=false,notifHidden=false;
+window.toggleChat=function(){{
+  chatOpen=!chatOpen;
+  document.getElementById('chatbot-widget').style.display=chatOpen?'flex':'none';
+  document.getElementById('chatbot-notif').style.display='none';
+  notifHidden=true;
+  if(chatOpen) document.getElementById('chat-input').focus();
+}};
+window.sendQuick=function(txt){{
+  document.getElementById('chat-input').value=txt;
+  sendMsg();
+}};
+function sendMsg(){{
+  var inp=document.getElementById('chat-input');
+  var msg=inp.value.trim();
+  if(!msg) return;
+  inp.value='';
+  var qb=document.getElementById('quick-btns');
+  if(qb) qb.style.display='none';
+  addMsg(msg,'user');
+  var typing=addTyping();
+  fetch('/api/chatbot',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{message:msg}})}})
+    .then(function(r){{return r.json();}})
+    .then(function(d){{
+      typing.remove();
+      addMsg(d.response||"Désolé, réessaie ou contacte-nous sur Discord !",'bot');
+    }}).catch(function(){{
+      typing.remove();
+      addMsg("Oups, erreur réseau. Rejoins notre Discord pour de l'aide !",'bot');
+    }});
+}};
+window.sendMsg=sendMsg;
+function addMsg(text,type){{
+  var div=document.createElement('div');
+  div.className=type==='user'?'user-msg':'bot-msg';
+  div.innerHTML=text.replace(/\\*\\*(.*?)\\*\\*/g,'<b>$1</b>').replace(/\\[(.*?)\\]\\((.*?)\\)/g,'<a href="$2" target="_blank" style="color:var(--accent)">$1</a>').replace(/\\n/g,'<br>');
+  document.getElementById('chat-messages').appendChild(div);
+  document.getElementById('chat-messages').scrollTop=99999;
+  return div;
+}}
+function addTyping(){{
+  var div=document.createElement('div');
+  div.className='bot-typing';
+  div.innerHTML='<span></span><span></span><span></span>';
+  document.getElementById('chat-messages').appendChild(div);
+  document.getElementById('chat-messages').scrollTop=99999;
+  return div;
+}}
+setTimeout(function(){{if(!notifHidden)document.getElementById('chatbot-notif').style.display='none';}},8000);
+}})();
+</script>"""
+
+def _site_footer():
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    site_title   = get_site_setting("site_title", "WinOptimizer Pro")
+    return f"""
+<footer>
+  <div style="font-size:22px;font-weight:900;background:linear-gradient(135deg,#4f8ef7,#7c5cbf);-webkit-background-clip:text;-webkit-text-fill-color:transparent">{site_title}</div>
+  <div class="links">
+    <a href="/">Accueil</a>
+    <a href="/features">Fonctionnalités</a>
+    <a href="/pricing">Tarifs</a>
+    <a href="/client">Espace Client</a>
+    <a href="{discord_link}" target="_blank">Discord</a>
+  </div>
+  <div style="color:var(--text2);font-size:12px">© 2025 {site_title} — Tous droits réservés</div>
+</footer>
+{_site_chatbot()}"""
+
+@app.route("/")
+def site_home():
+    if get_site_setting("site_maintenance") == "1":
+        return _site_maintenance_page()
+    track_visit("/")
+
+    # Dynamic settings
+    site_title    = get_site_setting("site_title", "WinOptimizer Pro")
+    site_tagline  = get_site_setting("site_tagline", "Optimise ton Windows pour des FPS max")
+    site_desc     = get_site_setting("site_description", "Le logiciel d'optimisation Windows le plus avancé pour les gamers.")
+    hero_badge    = get_site_setting("hero_badge", "⚡ +5000 utilisateurs satisfaits")
+    discord_link  = get_site_setting("discord_invite", DISCORD_INVITE)
+    s1v = get_site_setting("stat1_val","+97"); s1l = get_site_setting("stat1_label","Optimisations")
+    s2v = get_site_setting("stat2_val","+25"); s2l = get_site_setting("stat2_label","Jeux supportés")
+    s3v = get_site_setting("stat3_val","-30ms"); s3l = get_site_setting("stat3_label","Latence réseau")
+    s4v = get_site_setting("stat4_val","+15%"); s4l = get_site_setting("stat4_label","FPS moyens")
+    show_reviews  = get_site_setting("reviews_enabled","1") == "1"
+    show_faq      = get_site_setting("faq_enabled","1") == "1"
+    announce_on   = get_site_setting("announcement_bar","0") == "1"
+    announce_text = get_site_setting("announcement_text","")
+    announce_color= get_site_setting("announcement_color","blue")
+
+    # Products from DB
+    conn = get_db()
+    products = conn.execute("SELECT * FROM site_products WHERE active=1 ORDER BY sort_order").fetchall()
+    testimonials = conn.execute("SELECT * FROM site_testimonials WHERE active=1 ORDER BY created_at DESC LIMIT 6").fetchall()
+    faq_rows = conn.execute("SELECT * FROM site_faq WHERE active=1 ORDER BY sort_order").fetchall()
+    conn.close()
+
+    # Build features cards from product names/descriptions
+    features = [
+        ("⚡", "Ultra Performance", "Optimise ton CPU, GPU, RAM et SSD pour des FPS max en jeu."),
+        ("🔒", "Confidentialité", "Désactive la télémétrie Windows et les trackers Microsoft."),
+        ("🎮", "Gaming Pack", "25+ tweaks spécifiques pour Valorant, CS2, Fortnite et plus."),
+        ("💾", "Nettoyage", "Libère de l'espace et nettoie les fichiers inutiles automatiquement."),
+        ("🌐", "Réseau Pro", "Réduit la latence réseau de -30ms avec les tweaks TCP avancés."),
+        ("🔄", "Mises à jour auto", "Le logiciel se met à jour automatiquement depuis le panel admin."),
+    ]
+    feat_html = ""
+    for icon, title, desc in features:
+        feat_html += f"""<div class="card"><div class="feat-icon">{icon}</div>
+        <div class="feat-title">{title}</div><div class="feat-desc">{desc}</div></div>"""
+
+    # Build pricing cards
+    pricing_html = ""
+    for p in products:
+        feats = (p["features"] or "").split("|")
+        feats_html = "".join(f'<li><span class="chk">✓</span>{f}</li>' for f in feats if f.strip())
+        badge_html = f'<div class="plan-badge">{p["badge"]}</div>' if p["badge"] else ""
+        popular_cls = " popular" if p["badge"] else ""
+        pricing_html += f"""
+        <div class="plan-card{popular_cls}">
+          {badge_html}
+          <div class="plan-name">{'⭐' if p['plan']=='PRO' else '🔷'} {p['name']}</div>
+          <div class="plan-price"><sup>€</sup>{p['price']:.2f}</div>
+          <div style="color:var(--text2);font-size:13px;margin-bottom:16px">{p['description'] or ''}</div>
+          <ul class="plan-features">{feats_html}</ul>
+          <a href="{discord_link}" target="_blank" class="btn {'btn-primary' if p['plan']=='PRO' else 'btn-outline'}" style="width:100%;padding:14px;text-align:center;margin-top:16px">💬 Acheter via Discord</a>
+        </div>"""
+
+    # Testimonials
+    reviews_html = ""
+    if show_reviews and testimonials:
+        cards = ""
+        for t in testimonials:
+            stars = "⭐" * int(t["rating"])
+            cards += f"""<div class="card" style="text-align:left">
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+                <div style="font-size:28px">{t['avatar'] or '👤'}</div>
+                <div><div style="font-weight:700">{t['author']}</div>
+                <div style="color:var(--text2);font-size:12px">{t['game'] or ''}</div></div>
+                <div style="margin-left:auto;font-size:14px">{stars}</div>
+              </div>
+              <div style="color:var(--text2);font-size:14px;line-height:1.6">"{t['content']}"</div>
+            </div>"""
+        reviews_html = f"""
+<section class="section">
+  <div class="section-title">Ce qu'ils en disent</div>
+  <div class="section-sub">Des milliers de gamers font confiance à WinOptimizer Pro</div>
+  <div class="grid-3">{cards}</div>
+</section>"""
+
+    # FAQ section
+    faq_html = ""
+    if show_faq and faq_rows:
+        items = ""
+        for f in faq_rows:
+            items += f"""<div class="faq-item">
+              <div class="faq-q" onclick="toggleFaq(this)">{f['question']}<span class="faq-arrow">▼</span></div>
+              <div class="faq-a">{f['answer']}</div>
+            </div>"""
+        faq_html = f"""
+<section class="section" style="background:var(--card2)">
+  <div class="section-title">Questions fréquentes</div>
+  <div class="section-sub">Tout ce que tu veux savoir sur WinOptimizer Pro</div>
+  <div style="max-width:780px;margin:0 auto">{items}</div>
+</section>"""
+
+    # Announcement bar
+    announce_html = ""
+    if announce_on and announce_text:
+        colors = {"blue":"rgba(79,142,247,.15)","green":"rgba(0,255,136,.1)","red":"rgba(255,68,102,.1)","gold":"rgba(255,215,0,.1)"}
+        border_colors = {"blue":"rgba(79,142,247,.4)","green":"rgba(0,255,136,.3)","red":"rgba(255,68,102,.3)","gold":"rgba(255,215,0,.3)"}
+        bg = colors.get(announce_color,"rgba(79,142,247,.15)")
+        bd = border_colors.get(announce_color,"rgba(79,142,247,.4)")
+        announce_html = f'<div style="background:{bg};border-bottom:1px solid {bd};text-align:center;padding:10px 20px;font-size:14px">{announce_text}</div>'
+
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{site_title} — {site_tagline}</title>{SITE_CSS}
+<style>
+.faq-item{{background:var(--card);border:1px solid var(--border);border-radius:12px;margin-bottom:10px;overflow:hidden;transition:border-color .2s}}
+.faq-item.active{{border-color:rgba(79,142,247,.4)}}
+.faq-q{{padding:16px 20px;cursor:pointer;font-weight:600;display:flex;justify-content:space-between;align-items:center;gap:12px;transition:background .2s;user-select:none}}
+.faq-q:hover{{background:rgba(79,142,247,.06)}}
+.faq-arrow{{flex-shrink:0;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(79,142,247,.1);color:var(--accent);font-size:12px;transition:transform .3s,background .2s}}
+.faq-item.active .faq-arrow{{transform:rotate(180deg);background:rgba(79,142,247,.2)}}
+.faq-a{{max-height:0;overflow:hidden;transition:max-height .35s ease,padding .3s ease;color:var(--text2);font-size:14px;line-height:1.7;padding:0 20px}}
+.faq-item.active .faq-a{{max-height:600px;padding:0 20px 18px}}
+</style>
+<script>
+function toggleFaq(el){{
+  var item=el.closest('.faq-item');
+  var wasOpen=item.classList.contains('active');
+  document.querySelectorAll('.faq-item.active').forEach(function(i){{if(i!==item)i.classList.remove('active');}});
+  if(wasOpen){{item.classList.remove('active');}}else{{item.classList.add('active');}}
+}}
+</script>
+</head><body>
+{announce_html}
+{_site_nav("home")}
+<section class="hero">
+  <div style="display:inline-block;background:rgba(79,142,247,.1);border:1px solid rgba(79,142,247,.3);
+    border-radius:20px;padding:6px 18px;font-size:13px;color:var(--accent);margin-bottom:20px">
+    {hero_badge}
+  </div>
+  <h1>{site_tagline}<br><span>pour des FPS max</span></h1>
+  <p>{site_desc}</p>
+  <div class="hero-btns">
+    <a href="/pricing" class="btn btn-primary" style="padding:14px 36px;font-size:16px">🚀 Obtenir ma licence</a>
+    <a href="/features" class="btn btn-outline" style="padding:14px 36px;font-size:16px">Voir les fonctionnalités</a>
+  </div>
+</section>
+
+<section class="section" style="background:var(--card2);padding:28px 5%">
+  <div class="stats-bar">
+    <div class="stat-item"><div class="stat-num" style="color:var(--accent)">{s1v}</div><div class="stat-lbl">{s1l}</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:var(--green)">{s2v}</div><div class="stat-lbl">{s2l}</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:var(--gold)">{s3v}</div><div class="stat-lbl">{s3l}</div></div>
+    <div class="stat-item"><div class="stat-num" style="color:var(--purple)">{s4v}</div><div class="stat-lbl">{s4l}</div></div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-title">Tout ce dont tu as besoin</div>
+  <div class="section-sub">Des outils puissants pour chaque aspect de ta machine</div>
+  <div class="grid-3">{feat_html}</div>
+</section>
+
+<section class="section" style="background:var(--card2)">
+  <div class="section-title">Choisir ton plan</div>
+  <div class="section-sub">Un paiement unique, une licence à vie — sans abonnement</div>
+  <div class="grid-2" style="max-width:820px;margin:0 auto">{pricing_html}</div>
+</section>
+
+{reviews_html}
+{faq_html}
+
+<section class="section" style="background:var(--card2);text-align:center">
+  <div class="section-title">Prêt à booster ton PC ?</div>
+  <div class="section-sub">Rejoins des milliers de gamers qui font confiance à {site_title}</div>
+  <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
+    <a href="/pricing" class="btn btn-primary" style="padding:14px 36px;font-size:16px">🛍️ Acheter maintenant</a>
+    <a href="{discord_link}" target="_blank" class="btn btn-outline" style="padding:14px 36px;font-size:16px">💬 Rejoindre Discord</a>
+  </div>
+</section>
+
+{_site_footer()}
+</body></html>""")
+
+@app.route("/features")
+def site_features():
+    if get_site_setting("site_maintenance") == "1":
+        return _site_maintenance_page()
+    track_visit("/features")
+    features_detailed = [
+        ("🔒", "Confidentialité & Vie privée", [
+            "Désactiver la télémétrie Windows", "Bloquer les trackers Microsoft",
+            "Désactiver Xbox Game Bar", "Bloquer micro/caméra pour les apps",
+            "Supprimer l'historique presse-papier", "Désactiver Bing dans la recherche"]),
+        ("⚡", "Performances CPU & Mémoire", [
+            "Désactiver HPET (High Precision Event Timer)", "CPU Priority First Plan",
+            "MMCSS SystemResponsiveness=0", "Désactiver Core Parking",
+            "Désactiver C-States CPU", "I/O Priority Gaming"]),
+        ("🎮", "Gaming & FPS", [
+            "Tweaks spécifiques 25+ jeux", "Désactiver Fullscreen Optimizations",
+            "GPU Hardware Scheduling", "Polling Rate souris maximum",
+            "Latence clavier minimum", "DWM mode jeu"]),
+        ("🌐", "Réseau & Latence", [
+            "TCP NoDelay activé", "Nagle Algorithm off (-30ms)",
+            "DNS Cloudflare 1.1.1.1", "Désactiver Network Throttling",
+            "Buffer réseau gaming optimisé", "IPv6 désactivé"]),
+        ("💾", "Stockage & Nettoyage", [
+            "Activer TRIM SSD", "Nettoyage fichiers temporaires",
+            "Vider cache shaders", "Nettoyer Prefetch",
+            "Vider corbeille automatique", "Nettoyer logs Windows"]),
+        ("🔋", "Énergie & Démarrage", [
+            "Plan Ultimate Performance", "CPU Throttling off",
+            "Désactiver Dynamic Tick", "Réduire délai boot",
+            "Désactiver services inutiles", "Activer démarrage rapide"]),
+    ]
+    sections_html = ""
+    for icon, title, items in features_detailed:
+        items_html = "".join(f'<li style="padding:6px 0;border-bottom:1px solid var(--border);font-size:14px;color:var(--text2)">✅ {i}</li>' for i in items)
+        sections_html += f"""<div class="card">
+          <div class="feat-icon">{icon}</div>
+          <div class="feat-title" style="font-size:18px;margin-bottom:16px">{title}</div>
+          <ul style="list-style:none">{items_html}</ul>
+        </div>"""
+
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fonctionnalités — WinOptimizer Pro</title>{SITE_CSS}</head><body>
+{_site_nav("features")}
+<section class="hero" style="padding:60px 5% 40px">
+  <h1>Toutes les <span>fonctionnalités</span></h1>
+  <p>+97 optimisations réparties en 6 catégories pour maximiser chaque aspect de ton PC.</p>
+</section>
+<section class="section">
+  <div class="grid-3">{sections_html}</div>
+</section>
+<section class="section" style="background:var(--card2);text-align:center">
+  <div class="section-title">Convaincu ?</div>
+  <div class="section-sub">Obtiens ta licence et commence à optimiser dès maintenant.</div>
+  <a href="/pricing" class="btn btn-primary" style="padding:14px 36px;font-size:16px">🚀 Voir les tarifs</a>
+</section>
+{_site_footer()}
+</body></html>""")
+
+@app.route("/pricing")
+def site_pricing():
+    if get_site_setting("site_maintenance") == "1":
+        return _site_maintenance_page()
+    track_visit("/pricing")
+    normal_active = get_site_setting("product_normal_active") == "1"
+    pro_active    = get_site_setting("product_pro_active")    == "1"
+    stock_n = int(get_site_setting("stock_normal","999"))
+    stock_p = int(get_site_setting("stock_pro","999"))
+    # Lire les prix et produits depuis la DB (dynamique)
+    conn_pr = get_db()
+    db_products = conn_pr.execute(
+        "SELECT * FROM site_products WHERE active=1 ORDER BY sort_order").fetchall()
+    conn_pr.close()
+    # Prix depuis site_settings (modifiables dans l'admin)
+    price_normal = float(get_site_setting("price_normal", str(SHOP_PRICES["NORMAL"]["price"])))
+    price_pro    = float(get_site_setting("price_pro",    str(SHOP_PRICES["PRO"]["price"])))
+
+    comparison = [
+        ("Optimisations réseau", True, True),
+        ("Optimisations confidentialité", True, True),
+        ("Plan Haute Performance", True, True),
+        ("Nettoyage système", True, True),
+        ("Gaming Pack (25+ jeux)", True, True),
+        ("Tweaks CPU avancés", False, True),
+        ("HPET & Core Parking off", False, True),
+        ("Overclock CPU/GPU sécurisé", False, True),
+        ("Preset Ultra Performance", False, True),
+        ("Preset Streamer", False, True),
+        ("6 Addons gaming inclus", False, True),
+        ("Support prioritaire", False, True),
+    ]
+    comp_rows = ""
+    for label, has_normal, has_pro in comparison:
+        comp_rows += f"""<tr>
+          <td>{label}</td>
+          <td style="text-align:center">{'<span class="badge-yes">✓</span>' if has_normal else '<span class="badge-no">—</span>'}</td>
+          <td style="text-align:center">{'<span class="badge-yes">✓</span>' if has_pro else '<span class="badge-no">—</span>'}</td>
+        </tr>"""
+
+    discord_link_pricing = get_site_setting("discord_invite", DISCORD_INVITE)
+    msg = request.args.get("msg","")
+    msg_html = f'<div class="msg-ok" style="max-width:500px;margin:0 auto 24px">{msg}</div>' if msg else ""
+
+    # Build plan cards from DB products (prices + features dynamiques)
+    _plan_cards_html = ""
+    if db_products:
+        for _p in db_products:
+            _is_pro = _p["plan"] == "PRO"
+            _price  = price_pro if _is_pro else price_normal
+            _active = pro_active if _is_pro else normal_active
+            _stock  = stock_p if _is_pro else stock_n
+            _feats  = [f.strip() for f in (_p["features"] or "").split("|") if f.strip()]
+            _fl     = "".join(f'<li><span class="chk">✓</span>{f}</li>' for f in _feats)
+            _badge  = f'<div class="plan-badge">{_p["badge"]}</div>' if _p.get("badge") else ""
+            _pop    = " popular" if _p.get("badge") else ""
+            _btn    = (f'<a href="{discord_link_pricing}" target="_blank" class="btn {"btn-primary" if _is_pro else "btn-outline"}" style="width:100%;padding:14px;text-align:center">💬 Acheter via Discord</a>'
+                       if _active and _stock > 0 else '<div style="color:var(--muted);font-size:14px;padding:12px">Indisponible</div>')
+            _icon   = "⭐" if _is_pro else "🔷"
+            _plan_cards_html += f"""<div class="plan-card{_pop}">
+      {_badge}
+      <div class="plan-name">{_icon} {_p["name"]}</div>
+      <div class="plan-price"><sup>€</sup>{_price:.2f}</div>
+      <div style="color:var(--text2);font-size:14px;margin-bottom:20px">{_p["description"] or "Paiement unique"}</div>
+      <ul class="plan-features">{_fl}</ul>
+      {_btn}
+    </div>"""
+    else:
+        # Fallback si pas de produits en DB
+        for _plan_key, _price, _active_f, _stock_f, _icon, _pop, _badge_txt, _default_feats in [
+            ("NORMAL", price_normal, normal_active, stock_n, "🔷", "", "",
+             ["+50 optimisations essentielles","Gaming Pack 25+ jeux","Réseau & confidentialité","Espace client inclus"]),
+            ("PRO", price_pro, pro_active, stock_p, "⭐", " popular", "⭐ LE PLUS POPULAIRE",
+             ["Tout NORMAL","47 tweaks avancés","Overclock sécurisé","6 addons gaming","Support prioritaire"]),
+        ]:
+            _fl = "".join(f'<li><span class="chk">✓</span>{f}</li>' for f in _default_feats)
+            _badge = f'<div class="plan-badge">{_badge_txt}</div>' if _badge_txt else ""
+            _btn = (f'<a href="{discord_link_pricing}" target="_blank" class="btn {"btn-primary" if _plan_key=="PRO" else "btn-outline"}" style="width:100%;padding:14px;text-align:center">💬 Acheter via Discord</a>'
+                    if _active_f and _stock_f > 0 else '<div style="color:var(--muted);font-size:14px;padding:12px">Indisponible</div>')
+            _plan_cards_html += f"""<div class="plan-card{_pop}">
+      {_badge}
+      <div class="plan-name">{_icon} {_plan_key}</div>
+      <div class="plan-price"><sup>€</sup>{_price:.2f}</div>
+      <ul class="plan-features">{_fl}</ul>
+      {_btn}
+    </div>"""
+
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tarifs — WinOptimizer Pro</title>{SITE_CSS}</head><body>
+{_site_nav("pricing")}
+<section class="hero" style="padding:60px 5% 40px">
+  <h1>Des prix <span>accessibles</span></h1>
+  <p>Un paiement unique, une licence à vie. Pas d'abonnement.</p>
+</section>
+<section class="section">
+  {msg_html}
+  <div class="grid-2" style="max-width:840px;margin:0 auto">
+    {_plan_cards_html}
+  </div>
+
+  <div class="section-title" style="margin-top:60px;font-size:24px">Comparaison détaillée</div>
+  <div style="max-width:700px;margin:24px auto;overflow-x:auto">
+    <table class="diff-table">
+      <thead><tr>
+        <th>Fonctionnalité</th>
+        <th style="text-align:center">🔷 NORMAL</th>
+        <th style="text-align:center">⭐ PRO</th>
+      </tr></thead>
+      <tbody>{comp_rows}</tbody>
+    </table>
+  </div>
+</section>
+
+{_site_footer()}
+</body></html>""")
+
+def _site_maintenance_page():
+    site_title   = get_site_setting("site_title","WinOptimizer Pro")
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    maint_msg    = get_site_setting("maintenance_site_msg","Nous revenons très bientôt. Merci de ta patience !")
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Maintenance — {site_title}</title>{SITE_CSS}</head><body>
+<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px">
+  <div>
+    <div style="font-size:72px;margin-bottom:20px">🔧</div>
+    <div style="font-size:28px;font-weight:900;background:linear-gradient(135deg,#4f8ef7,#7c5cbf);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:16px">⚡ {site_title}</div>
+    <h1 style="font-size:28px;font-weight:800;margin-bottom:12px">Site en maintenance</h1>
+    <p style="color:var(--text2);margin-bottom:24px;max-width:400px">{maint_msg}</p>
+    <a href="{discord_link}" target="_blank" class="btn btn-primary" style="padding:12px 28px">💬 Rejoindre Discord</a>
+  </div>
+</div></body></html>""")
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ESPACE CLIENT — Login username + mdp (même que le logiciel)
+# ─────────────────────────────────────────────────────────────────────────────
+
+CLIENT_CSS = """<style>
+.ec-nav{background:rgba(13,13,15,.97);backdrop-filter:blur(12px);border-bottom:1px solid var(--border);
+  position:sticky;top:0;z-index:100;padding:0 5%}
+.ec-nav-inner{display:flex;align-items:center;justify-content:space-between;height:60px}
+.ec-tabs{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:24px;overflow-x:auto}
+.ec-tab{padding:12px 20px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;
+  border-bottom:2px solid transparent;color:var(--text2);text-decoration:none;transition:.2s}
+.ec-tab.active{border-bottom-color:var(--accent);color:var(--text)}
+.ec-tab:hover{color:var(--text)}
+.ec-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px;margin-bottom:16px}
+.ec-card-title{font-size:14px;font-weight:700;margin-bottom:14px;color:var(--text)}
+.ec-stat{background:var(--card2);border-radius:10px;padding:14px;text-align:center}
+.ec-input{width:100%;background:var(--card2);border:1px solid var(--border);border-radius:8px;
+  padding:10px 14px;color:var(--text);font-size:14px;outline:none;box-sizing:border-box}
+.ec-input:focus{border-color:var(--accent)}
+.ec-label{display:block;font-size:12px;color:var(--text2);margin-bottom:6px;margin-top:12px}
+.ec-btn{display:inline-block;padding:10px 20px;border-radius:8px;font-weight:700;font-size:14px;
+  cursor:pointer;border:none;transition:.2s}
+.ec-btn-primary{background:linear-gradient(135deg,var(--accent),var(--purple));color:#fff}
+.ec-btn-primary:hover{opacity:.88;transform:translateY(-1px)}
+.ec-btn-outline{background:transparent;border:1px solid var(--border);color:var(--text2)}
+.ec-btn-outline:hover{border-color:var(--accent);color:var(--text)}
+.ec-badge-plan{padding:4px 12px;border-radius:20px;font-size:12px;font-weight:700}
+.ec-badge-pro{background:linear-gradient(135deg,rgba(255,215,0,.2),rgba(124,92,191,.2));
+  border:1px solid rgba(255,215,0,.4);color:var(--gold)}
+.ec-badge-normal{background:rgba(79,142,247,.15);border:1px solid rgba(79,142,247,.3);color:var(--accent)}
+.ticket-row{background:var(--card2);border-radius:10px;padding:14px;margin-bottom:10px;border:1px solid var(--border)}
+.ticket-status-open{color:var(--gold)}
+.ticket-status-answered{color:var(--accent)}
+.ticket-status-closed{color:var(--text2)}
+</style>"""
+
+def _client_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("client_user"):
+            return redirect("/client/login")
+        return f(*args, **kwargs)
+    return decorated
+
+def _client_nav(active="dashboard", username="", plan="NORMAL"):
+    plan_badge = f'<span class="ec-badge-plan ec-badge-{"pro" if plan=="PRO" else "normal"}">{"⭐ PRO" if plan=="PRO" else "🔷 NORMAL"}</span>'
+    tabs = [("dashboard","🏠 Tableau de bord"),("licence","🔑 Ma licence"),
+            ("tickets","📩 Support"),("password","🔒 Mot de passe")]
+    items = "".join(f'<a href="/client/{t}" class="ec-tab {"active" if active==t else ""}">{label}</a>' for t,label in tabs)
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    site_title   = get_site_setting("site_title","WinOptimizer Pro")
+    return f"""
+<nav class="ec-nav">
+  <div class="ec-nav-inner">
+    <a href="/" style="font-size:18px;font-weight:900;background:linear-gradient(135deg,#4f8ef7,#7c5cbf);-webkit-background-clip:text;-webkit-text-fill-color:transparent">⚡ {site_title}</a>
+    <div style="display:flex;align-items:center;gap:12px">
+      <span style="font-size:13px;color:var(--text2)">👤 <b style="color:var(--text)">{username}</b></span>
+      {plan_badge}
+      <a href="{discord_link}" target="_blank" class="ec-btn ec-btn-outline" style="padding:6px 14px;font-size:12px">💬 Discord</a>
+      <a href="/client/logout" class="ec-btn ec-btn-outline" style="padding:6px 14px;font-size:12px">Déconnexion</a>
+    </div>
+  </div>
+</nav>
+<div style="max-width:900px;margin:32px auto;padding:0 20px">
+  <div class="ec-tabs">{items}</div>"""
+
+@app.route("/client")
+@app.route("/client/dashboard")
+def site_client():
+    if not session.get("client_user"):
+        return redirect("/client/login")
+    track_visit("/client")
+    username = session["client_user"]
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username=? AND status='active'", (username,)).fetchone()
+    if not user:
+        session.pop("client_user",None); conn.close(); return redirect("/client/login")
+    plan = user["plan"] if user["plan"] in ("NORMAL","PRO") else "PRO"
+    exe_url = get_site_setting(f"exe_url_{plan.lower()}","")
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    tickets_open = conn.execute("SELECT COUNT(*) FROM tickets WHERE user=? AND status='open'", (username,)).fetchone()[0]
+    tickets_ans  = conn.execute("SELECT COUNT(*) FROM tickets WHERE user=? AND status='answered'", (username,)).fetchone()[0]
+    last_ticket  = conn.execute("SELECT * FROM tickets WHERE user=? ORDER BY updated_at DESC LIMIT 1",(username,)).fetchone()
+    conn.close()
+    created_str = datetime.fromtimestamp(user["created_at"] or int(time.time())).strftime("%d/%m/%Y")
+    last_login_str = datetime.fromtimestamp(user["last_login"] or int(time.time())).strftime("%d/%m/%Y %H:%M")
+    ticket_alert = ""
+    if last_ticket and last_ticket["status"]=="answered" and last_ticket["response"]:
+        ticket_alert = f'<div style="background:rgba(79,142,247,.1);border:1px solid rgba(79,142,247,.3);border-radius:10px;padding:14px;margin-bottom:16px;font-size:13px">📩 <b>Réponse reçue sur ton ticket #{last_ticket["id"]}</b> — <a href="/client/tickets" style="color:var(--accent)">Voir la réponse →</a></div>'
+    site_title = get_site_setting("site_title","WinOptimizer Pro")
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Espace Client — {site_title}</title>{SITE_CSS}{CLIENT_CSS}</head><body>
+{_client_nav("dashboard", username, plan)}
+{ticket_alert}
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:20px">
+  <div class="ec-stat"><div style="font-size:28px;font-weight:900;color:var(--accent)">{user['connections'] or 0}</div><div style="font-size:12px;color:var(--text2)">Connexions</div></div>
+  <div class="ec-stat"><div style="font-size:28px;font-weight:900;color:var(--gold)">{tickets_open}</div><div style="font-size:12px;color:var(--text2)">Tickets ouverts</div></div>
+  <div class="ec-stat"><div style="font-size:28px;font-weight:900;color:var(--green)">{tickets_ans}</div><div style="font-size:12px;color:var(--text2)">Tickets répondus</div></div>
+  <div class="ec-stat"><div style="font-size:14px;font-weight:700;color:var(--text)">{created_str}</div><div style="font-size:12px;color:var(--text2)">Membre depuis</div></div>
+</div>
+<div class="ec-card">
+  <div class="ec-card-title">📥 Télécharger {site_title}</div>
+  {'<a href="'+exe_url+'" class="ec-btn ec-btn-primary" style="width:100%;text-align:center;display:block;padding:14px">📥 Télécharger la dernière version</a>' if exe_url else '<div style="text-align:center;color:var(--text2);padding:16px">Lien de téléchargement bientôt disponible.<br>Rejoins le <a href="'+discord_link+'" target="_blank" style="color:var(--accent)">Discord</a> pour être notifié.</div>'}
+  <div style="margin-top:12px;font-size:12px;color:var(--text2);text-align:center">
+    Dernière connexion au logiciel : {last_login_str} · Plan : {'⭐ PRO' if plan=='PRO' else '🔷 NORMAL'}
+  </div>
+</div>
+<div class="ec-card">
+  <div class="ec-card-title">⚡ Actions rapides</div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px">
+    <a href="/client/licence" class="ec-btn ec-btn-outline" style="text-align:center;padding:12px">🔑 Voir ma licence</a>
+    <a href="/client/tickets" class="ec-btn ec-btn-outline" style="text-align:center;padding:12px">📩 Ouvrir un ticket</a>
+    <a href="{discord_link}" target="_blank" class="ec-btn ec-btn-outline" style="text-align:center;padding:12px">💬 Rejoindre Discord</a>
+    <a href="/client/password" class="ec-btn ec-btn-outline" style="text-align:center;padding:12px">🔒 Changer mdp</a>
+  </div>
+</div>
+</div>{_site_footer()}</body></html>""")
+
+@app.route("/client/licence")
+@_client_required
+def site_client_licence():
+    username = session["client_user"]
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    addon_rows = conn.execute("SELECT addon_key FROM user_addons WHERE username=?", (username,)).fetchall()
+    conn.close()
+    plan = user["plan"] if user["plan"] in ("NORMAL","PRO") else "PRO"
+    active_addons = [r["addon_key"] for r in addon_rows]
+    if plan == "PRO":
+        for a in ["fps_counter","vibrance","ram_cleaner","overclock","antilag","process_boost"]:
+            if a not in active_addons: active_addons.append(a)
+    ADDON_NAMES = {"fps_counter":"📊 FPS Counter","vibrance":"🎨 Vibrance","ram_cleaner":"🧹 RAM Cleaner",
+                   "overclock":"⚡ Overclock","antilag":"🌐 Anti-Lag","process_boost":"🚀 Process Boost",
+                   "crosshair":"🎯 Crosshair","gpu_tuner":"🖥 GPU Tuner","network_mon":"📡 Network Mon",
+                   "temp_mon":"🌡 Temp Monitor","input_lag":"⌨ Input Lag","boot_speed":"⚡ Boot Speed"}
+    addons_html = "".join(f'<span style="background:rgba(79,142,247,.12);border:1px solid rgba(79,142,247,.25);border-radius:6px;padding:4px 10px;font-size:12px;color:var(--accent)">{ADDON_NAMES.get(a,a)}</span>' for a in active_addons)
+    hw_rows = "".join(f'<tr><td style="color:var(--text2);font-size:12px">{l}</td><td style="font-size:12px">{v or "—"}</td></tr>'
+        for l,v in [("💻 OS",user["os_info"]),("⚡ CPU",user["cpu_info"]),("🎮 GPU",user["gpu_info"]),
+                    ("🧠 RAM",user["ram_info"]),("🗂 Carte mère",user["motherboard_info"]),("💾 Disque",user["disk_info"])])
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    site_title = get_site_setting("site_title","WinOptimizer Pro")
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ma Licence — {site_title}</title>{SITE_CSS}{CLIENT_CSS}</head><body>
+{_client_nav("licence", username, plan)}
+<div class="ec-card">
+  <div class="ec-card-title">🔑 Informations de licence</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+    <div><div style="font-size:11px;color:var(--text2)">Username</div><div style="font-weight:700;font-size:16px">{username}</div></div>
+    <div><div style="font-size:11px;color:var(--text2)">Plan</div><div>{'<span class="ec-badge-plan ec-badge-pro">⭐ PRO</span>' if plan=="PRO" else '<span class="ec-badge-plan ec-badge-normal">🔷 NORMAL</span>'}</div></div>
+    <div style="grid-column:1/-1"><div style="font-size:11px;color:var(--text2);margin-bottom:4px">Clé de licence</div>
+      <div style="font-family:monospace;color:var(--accent);background:var(--card2);padding:10px 14px;border-radius:8px;letter-spacing:2px;display:flex;justify-content:space-between;align-items:center">
+        <span>{user["license_key"] or "—"}</span>
+        <button onclick="navigator.clipboard.writeText('{user['license_key'] or ''}');this.textContent='✅ Copié!';setTimeout(()=>this.textContent='📋 Copier',2000)" style="background:none;border:1px solid var(--border);color:var(--text2);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:12px">📋 Copier</button>
+      </div>
+    </div>
+    <div><div style="font-size:11px;color:var(--text2)">HWID machine</div><div style="font-family:monospace;font-size:11px;color:var(--text2)">{(user["hwid"] or "Non enregistré")[:32]}</div></div>
+    <div><div style="font-size:11px;color:var(--text2)">Discord ID</div><div style="font-size:13px">{user["discord_id"] or "Non lié"}</div></div>
+  </div>
+</div>
+<div class="ec-card">
+  <div class="ec-card-title">🎮 Addons actifs ({len(active_addons)})</div>
+  {'<div style="display:flex;flex-wrap:wrap;gap:8px">'+addons_html+'</div>' if active_addons else '<div style="color:var(--text2);font-size:13px">Aucun addon actif.</div>'}
+  {'<div style="margin-top:12px;font-size:12px;color:var(--text2)">Les addons PRO sont inclus automatiquement avec ton plan.</div>' if plan=="PRO" else ''}
+</div>
+<div class="ec-card">
+  <div class="ec-card-title">🖥️ Configuration matérielle</div>
+  <table style="width:100%;border-collapse:collapse">
+    <tbody>{hw_rows}</tbody>
+  </table>
+  {'<div style="margin-top:10px;font-size:12px;color:var(--text2)">Configuration enregistrée à ta dernière connexion au logiciel.</div>'}
+</div>
+<div class="ec-card" style="text-align:center;padding:20px">
+  <div style="font-size:13px;color:var(--text2);margin-bottom:12px">Besoin de réinitialiser ton HWID ou ton compte ?</div>
+  <a href="{discord_link}" target="_blank" class="ec-btn ec-btn-outline">💬 Ouvrir un ticket sur Discord</a>
+  <span style="color:var(--text2);margin:0 8px">ou</span>
+  <a href="/client/tickets" class="ec-btn ec-btn-primary">📩 Créer un ticket ici</a>
+</div>
+</div>{_site_footer()}</body></html>""")
+
+@app.route("/client/tickets")
+@_client_required
+def site_client_tickets():
+    username = session["client_user"]
+    conn = get_db()
+    user = conn.execute("SELECT plan FROM users WHERE username=?", (username,)).fetchone()
+    plan = user["plan"] if user else "NORMAL"
+    tickets = conn.execute("SELECT * FROM tickets WHERE user=? ORDER BY created_at DESC", (username,)).fetchall()
+    conn.close()
+    tickets_html = ""
+    for t in tickets:
+        status_map = {"open":("ticket-status-open","🟡 Ouvert"),"answered":("ticket-status-answered","💬 Répondu"),"closed":("","✅ Fermé")}
+        sc, sl = status_map.get(t["status"], ("","?"))
+        date_str = datetime.fromtimestamp(t["created_at"]).strftime("%d/%m/%Y %H:%M")
+        prio_color = {"urgent":"var(--red)","high":"var(--gold)"}.get(t["priority"],"var(--text2)")
+        tickets_html += f"""
+<div class="ticket-row">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+    <div>
+      <span style="font-weight:700">#{t['id']} — {t['subject']}</span>
+      <span style="font-size:11px;color:var(--text2);margin-left:8px">{date_str}</span>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span style="font-size:11px;color:{prio_color}">{t['priority'].upper()}</span>
+      <span class="{sc}" style="font-size:12px;font-weight:600">{sl}</span>
+    </div>
+  </div>
+  <div style="font-size:13px;color:var(--text2);margin-bottom:{'8px' if t['response'] else '0'}">{t['message'][:200]}{"…" if len(t['message'])>200 else ""}</div>
+  {f'<div style="background:rgba(79,142,247,.08);border:1px solid rgba(79,142,247,.2);border-radius:8px;padding:10px 14px;margin-top:8px"><div style="font-size:11px;color:var(--accent);margin-bottom:4px">💬 Réponse du support</div><div style="font-size:13px">{t["response"]}</div></div>' if t["response"] else ""}
+</div>"""
+    site_title = get_site_setting("site_title","WinOptimizer Pro")
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Support — {site_title}</title>{SITE_CSS}{CLIENT_CSS}</head><body>
+{_client_nav("tickets", username, plan)}
+<div class="ec-card">
+  <div class="ec-card-title">📩 Créer un ticket de support</div>
+  <form method="POST" action="/client/tickets/create">
+    <label class="ec-label">Sujet *</label>
+    <input name="subject" class="ec-input" placeholder="Ex: Problème de connexion, Reset HWID..." required maxlength="100">
+    <label class="ec-label">Catégorie</label>
+    <select name="priority" class="ec-input" style="cursor:pointer">
+      <option value="normal">🔵 Normal — Question / demande</option>
+      <option value="high">🟡 Prioritaire — Problème qui bloque</option>
+      <option value="urgent">🔴 Urgent — Accès impossible</option>
+    </select>
+    <label class="ec-label">Message détaillé *</label>
+    <textarea name="message" class="ec-input" rows="5" placeholder="Décris ton problème en détail : étapes effectuées, messages d'erreur, etc." required maxlength="2000" style="resize:vertical"></textarea>
+    <div style="margin-top:6px;font-size:11px;color:var(--text2)">🔒 Ton username ({username}) est transmis automatiquement.</div>
+    <button type="submit" class="ec-btn ec-btn-primary" style="margin-top:14px;width:100%;padding:13px">📩 Envoyer le ticket</button>
+  </form>
+</div>
+<div class="ec-card">
+  <div class="ec-card-title">📋 Mes tickets ({len(tickets)})</div>
+  {tickets_html if tickets_html else f'<div style="text-align:center;padding:24px;color:var(--text2)">Aucun ticket pour l\'instant.<br><small>Tu peux aussi nous contacter directement sur <a href="{discord_link}" target="_blank" style="color:var(--accent)">Discord</a>.</small></div>'}
+</div>
+</div>{_site_footer()}</body></html>""")
+
+@app.route("/client/tickets/create", methods=["POST"])
+@_client_required
+def site_client_ticket_create():
+    username = session["client_user"]
+    subject  = request.form.get("subject","").strip()[:100]
+    message  = request.form.get("message","").strip()[:2000]
+    priority = request.form.get("priority","normal")
+    if not subject or not message:
+        return redirect("/client/tickets")
+    conn = get_db()
+    user = conn.execute("SELECT discord_id FROM users WHERE username=?", (username,)).fetchone()
+    discord_id = user["discord_id"] if user else ""
+    conn.execute("INSERT INTO tickets (user,discord_id,subject,message,status,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)",
+                 (username, discord_id, subject, message, "open", priority, int(time.time()), int(time.time())))
+    conn.commit(); conn.close()
+    add_log("OK","TICKET",f"Nouveau ticket [{priority}]: {subject[:40]}", username)
+    _push_sse({"type":"new_ticket","user":username,"subject":subject[:40],"priority":priority})
+    return redirect("/client/tickets")
+
+@app.route("/client/password", methods=["GET","POST"])
+@_client_required
+def site_client_password():
+    username = session["client_user"]
+    conn = get_db()
+    user = conn.execute("SELECT plan FROM users WHERE username=?", (username,)).fetchone()
+    plan = user["plan"] if user else "NORMAL"
+    conn.close()
+    msg = ""; msg_type = "ok"
+    if request.method == "POST":
+        old_pass = request.form.get("old_password","").strip()
+        new_pass = request.form.get("new_password","").strip()
+        confirm  = request.form.get("confirm_password","").strip()
+        if len(new_pass) < 6:
+            msg = "Le nouveau mot de passe doit faire au moins 6 caractères."; msg_type="err"
+        elif new_pass != confirm:
+            msg = "Les deux nouveaux mots de passe ne correspondent pas."; msg_type="err"
+        else:
+            conn = get_db()
+            row = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            valid = (_hash_password(old_pass) == row["password_hash"]) or (row["temp_password"] and old_pass == row["temp_password"])
+            if not valid:
+                msg = "Ancien mot de passe incorrect."; msg_type="err"; conn.close()
+            else:
+                conn.execute("UPDATE users SET password_hash=?,must_change_pass=0,temp_password=NULL WHERE username=?",
+                             (_hash_password(new_pass), username))
+                conn.commit(); conn.close()
+                add_log("OK","ACCOUNT",f"Mdp changé via espace client: {username}", username)
+                msg = "✅ Mot de passe changé avec succès !"; msg_type="ok"
+    site_title = get_site_setting("site_title","WinOptimizer Pro")
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mot de passe — {site_title}</title>{SITE_CSS}{CLIENT_CSS}</head><body>
+{_client_nav("password", username, plan)}
+<div class="ec-card" style="max-width:480px;margin:0 auto">
+  <div class="ec-card-title">🔒 Changer le mot de passe</div>
+  {'<div class="msg-ok">'+msg+'</div>' if msg and msg_type=="ok" else ''}
+  {'<div class="msg-err">'+msg+'</div>' if msg and msg_type=="err" else ''}
+  <form method="POST">
+    <label class="ec-label">Ancien mot de passe</label>
+    <input type="password" name="old_password" class="ec-input" required>
+    <label class="ec-label">Nouveau mot de passe</label>
+    <input type="password" name="new_password" class="ec-input" minlength="6" required>
+    <label class="ec-label">Confirmer le nouveau mot de passe</label>
+    <input type="password" name="confirm_password" class="ec-input" minlength="6" required>
+    <div style="margin-top:6px;font-size:11px;color:var(--text2)">Le mot de passe sera aussi mis à jour dans le logiciel.</div>
+    <button type="submit" class="ec-btn ec-btn-primary" style="margin-top:14px;width:100%;padding:13px">💾 Enregistrer</button>
+  </form>
+</div>
+</div>{_site_footer()}</body></html>""")
+
+@app.route("/client/login", methods=["GET","POST"])
+def site_client_login():
+    if session.get("client_user"):
+        return redirect("/client")
+    msg = ""; msg_type = "err"
+    if request.method == "POST":
+        username = request.form.get("username","").strip().lower()
+        password = request.form.get("password","").strip()
+        if not username or not password:
+            msg = "Remplis tous les champs."
+        else:
+            conn = get_db()
+            user = conn.execute("SELECT * FROM users WHERE username=? AND status='active'", (username,)).fetchone()
+            conn.close()
+            if not user:
+                msg = "Identifiants incorrects."
+            else:
+                ph = _hash_password(password)
+                valid = (ph == user["password_hash"]) or (user["must_change_pass"] and user["temp_password"] and password == user["temp_password"])
+                if valid:
+                    session["client_user"] = username
+                    add_log("OK","CLIENT_LOGIN",f"Connexion espace client: {username}", username)
+                    return redirect("/client")
+                else:
+                    msg = "Identifiants incorrects."
+    site_title = get_site_setting("site_title","WinOptimizer Pro")
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+    return render_template_string(f"""<!DOCTYPE html><html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connexion — {site_title}</title>{SITE_CSS}{CLIENT_CSS}</head><body>
+{_site_nav("client")}
+<section style="display:flex;align-items:center;justify-content:center;min-height:calc(100vh - 64px);padding:20px">
+  <div style="background:var(--card);border:1px solid var(--border);border-radius:20px;padding:40px;max-width:420px;width:100%">
+    <div style="text-align:center;margin-bottom:28px">
+      <div style="font-size:40px;margin-bottom:10px">⚡</div>
+      <h1 style="font-size:22px;font-weight:800">{site_title}</h1>
+      <p style="color:var(--text2);font-size:14px;margin-top:6px">Connexion à ton espace client</p>
+    </div>
+    {'<div class="msg-err">'+msg+'</div>' if msg else ''}
+    <form method="POST">
+      <div class="form-group"><label>Username</label>
+        <input type="text" name="username" class="form-control" placeholder="ton_username" autofocus required
+          style="width:100%;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:11px 14px;color:var(--text);font-size:14px;outline:none">
+      </div>
+      <div class="form-group" style="margin-top:14px"><label>Mot de passe</label>
+        <input type="password" name="password" class="form-control" placeholder="••••••••" required
+          style="width:100%;background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:11px 14px;color:var(--text);font-size:14px;outline:none">
+      </div>
+      <button type="submit" class="btn btn-primary" style="width:100%;padding:14px;margin-top:18px;font-size:15px">🔑 Se connecter</button>
+    </form>
+    <div style="margin-top:20px;text-align:center;font-size:13px;color:var(--text2)">
+      Tu as oublié ton mot de passe ou ton username ?<br>
+      <a href="{discord_link}" target="_blank" style="color:var(--accent)">💬 Contacte le support sur Discord</a>
+    </div>
+    <div style="margin-top:12px;text-align:center;font-size:12px;color:var(--text2)">
+      Tes identifiants sont les mêmes que dans le logiciel.
+    </div>
+  </div>
+</section>
+{_site_footer()}</body></html>""")
+
+@app.route("/client/logout")
+def site_client_logout():
+    session.pop("client_user", None)
+    session.pop("client_email", None)
+    return redirect("/client/login")
+
+@app.route("/client/invoice/<order_id>")
+def site_client_invoice(order_id):
+    client_user = session.get("client_user")
+    if not client_user: return redirect("/client/login")
+    conn = get_db()
+    order = conn.execute("SELECT * FROM shop_orders WHERE order_id=? AND username=?",
+                          (order_id, client_user)).fetchone()
+    conn.close()
+    if not order: return redirect("/client")
+    return _invoice_html(dict(order))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  API SHOP
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/api/shop/order", methods=["POST"])
+def api_shop_order():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "").split(",")[0].strip()
+    data = request.json or {}
+    email  = (data.get("email","") or "").strip().lower()
+    plan   = (data.get("plan","") or "").upper()
+    method = data.get("payment_method","paypal")
+    promo  = (data.get("promo","") or "").upper().strip()
+
+    if not email or "@" not in email:
+        return jsonify({"success": False, "error": "Email invalide"})
+    if plan not in ("NORMAL","PRO"):
+        return jsonify({"success": False, "error": "Plan invalide"})
+    if get_site_setting(f"product_{plan.lower()}_active") != "1":
+        return jsonify({"success": False, "error": "Produit indisponible"})
+    stock = int(get_site_setting(f"stock_{plan.lower()}", "999"))
+    if stock <= 0:
+        return jsonify({"success": False, "error": "Stock épuisé"})
+
+    price = SHOP_PRICES[plan]["price"]
+
+    # UNE SEULE connexion pour toute la transaction
+    conn = get_db()
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    try:
+        # Code promo
+        if promo:
+            pc = conn.execute(
+                "SELECT * FROM promo_codes WHERE code=? AND active=1 AND (max_uses=0 OR uses<max_uses) AND (plan='ALL' OR plan=?)",
+                (promo, plan)
+            ).fetchone()
+            if pc:
+                price = round(price * (1 - pc["reduction"]/100), 2)
+                conn.execute("UPDATE promo_codes SET uses=uses+1 WHERE id=?", (pc["id"],))
+
+        order_id = _gen_order_id()
+
+        # Clé de licence — même connexion
+        key_row = conn.execute(
+            "SELECT key FROM licenses WHERE status='active' AND plan=? AND key NOT IN (SELECT license_key FROM users WHERE license_key IS NOT NULL) LIMIT 1",
+            (plan,)
+        ).fetchone()
+        if key_row:
+            license_key = key_row["key"]
+            conn.execute("UPDATE licenses SET status='sold' WHERE key=?", (license_key,))
+        else:
+            license_key = generate_key(plan)
+            conn.execute("INSERT INTO licenses (key,plan,status,created_at) VALUES (?,?,?,?)",
+                         (license_key, plan, "sold", int(time.time())))
+
+        # Créer le compte utilisateur
+        username = email.split("@")[0].replace(".", "").replace("+","")[:16] + str(random.randint(10,99))
+        username = re.sub(r"[^a-z0-9]", "", username.lower())[:16]
+        password = _gen_client_password()
+
+        existing = conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
+        if existing:
+            username = username[:12] + str(random.randint(100,999))
+
+        password_hash = _hash_password(password)
+        conn.execute(
+            "INSERT OR IGNORE INTO users (username,password_hash,license_key,plan,status,created_at,ip,first_login_done) VALUES (?,?,?,?,?,?,?,0)",
+            (username, password_hash, license_key, plan, "active", int(time.time()), ip)
+        )
+
+        # Enregistrer la commande
+        conn.execute(
+            "INSERT INTO shop_orders (order_id,email,plan,price,status,license_key,username,ip,payment_method,created_at,promo_code) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (order_id, email, plan, price, "pending", license_key, username, ip, method, int(time.time()), promo or None)
+        )
+
+        # Décrémenter le stock dans la même transaction
+        conn.execute("INSERT OR REPLACE INTO site_settings VALUES (?,?)",
+                     (f"stock_{plan.lower()}", str(max(0, stock-1))))
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        add_log("ERR", "SHOP", f"Erreur commande: {e}", email)
+        return jsonify({"success": False, "error": "Erreur serveur, réessaie."})
+
+    conn.close()
+
+    # Email en arrière-plan
+    result = _send_email(
+        email,
+        f"✅ WinOptimizer Pro — Commande #{order_id} confirmée",
+        _welcome_email(email, username, password, plan, license_key, order_id)
+    )
+    print(f"[EMAIL RESULT] {result} → {email}")
+
+    add_log("OK", "SHOP", f"Commande {order_id} {plan} {price}€ email={email} method={method}", username)
+
+    return jsonify({
+        "success": True,
+        "order_id": order_id,
+        "message": f"Commande #{order_id} enregistrée ! Vérifiez votre email {email} pour vos identifiants."
+    })
+
+@app.route("/api/shop/check_promo")
+def api_check_promo():
+    code = (request.args.get("code","") or "").upper().strip()
+    plan = (request.args.get("plan","") or "").upper()
+    if not code:
+        return jsonify({"valid": False})
+    conn = get_db()
+    pc = conn.execute(
+        "SELECT * FROM promo_codes WHERE code=? AND active=1 AND (max_uses=0 OR uses<max_uses) AND (plan='ALL' OR plan=?)",
+        (code, plan)
+    ).fetchone()
+    conn.close()
+    if pc:
+        return jsonify({"valid": True, "reduction": pc["reduction"], "code": code})
+    return jsonify({"valid": False})
+
+@app.route("/api/shop/claim_role", methods=["POST"])
+def api_shop_claim_role():
+    """Appel depuis le bot Discord pour vérifier un N° commande et attribuer le rôle."""
+    data = request.json or {}
+    if data.get("bot_token") != BOT_TOKEN:
+        return jsonify({"success": False, "error": "Unauthorized"}), 403
+    order_id   = (data.get("order_id","") or "").upper().strip()
+    discord_id = (data.get("discord_id","") or "").strip()
+    conn = get_db()
+    order = conn.execute("SELECT * FROM shop_orders WHERE order_id=? AND status IN ('completed','pending')",
+                          (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify({"success": False, "error": "Commande introuvable"})
+    if order["claimed"] and order["discord_id"] and order["discord_id"] != discord_id:
+        conn.close()
+        return jsonify({"success": False, "error": "Commande déjà réclamée par un autre compte Discord"})
+    conn.execute("UPDATE shop_orders SET discord_id=?, claimed=1 WHERE order_id=?", (discord_id, order_id))
+    if order["username"]:
+        conn.execute("UPDATE users SET discord_id=? WHERE username=?", (discord_id, order["username"]))
+    conn.commit(); conn.close()
+    return jsonify({"success": True, "plan": order["plan"], "order_id": order_id})
+
+@app.route("/api/shop/invoice_lookup")
+def api_invoice_lookup():
+    """Recherche de facture par N° commande ou email (utilisé par le bot Discord)."""
+    if request.args.get("bot_token") != BOT_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 403
+    query = (request.args.get("query","") or "").strip()
+    conn = get_db()
+    if "@" in query:
+        orders = conn.execute("SELECT * FROM shop_orders WHERE email=? ORDER BY created_at DESC", (query,)).fetchall()
+    else:
+        orders = conn.execute("SELECT * FROM shop_orders WHERE order_id=?", (query.upper(),)).fetchall()
+    conn.close()
+    return jsonify({"orders": [dict(o) for o in orders]})
+
+@app.route("/api/internal/create_promo", methods=["POST"])
+def api_create_promo():
+    data = request.json or {}
+    if data.get("bot_token") != BOT_TOKEN:
+        return jsonify({"success": False, "error": "Unauthorized"}), 403
+    code     = (data.get("code","") or "").upper().strip()
+    reduction= int(data.get("reduction", 10))
+    plan     = (data.get("plan","ALL") or "ALL").upper()
+    max_uses = int(data.get("max_uses", 0))
+    by       = data.get("created_by","bot")
+    if not code:
+        return jsonify({"success": False, "error": "Code vide"})
+    try:
+        conn = get_db()
+        conn.execute("INSERT INTO promo_codes (code,reduction,plan,max_uses,created_by,created_at) VALUES (?,?,?,?,?,?)",
+                     (code, reduction, plan, max_uses, by, int(time.time())))
+        conn.commit(); conn.close()
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+@app.route("/api/internal/search_user")
+def api_search_user():
+    if request.args.get("bot_token") != BOT_TOKEN:
+        return jsonify({"error": "Unauthorized"}), 403
+    query = (request.args.get("query","") or "").strip()
+    conn  = get_db()
+    results = []
+    # Par username
+    r = conn.execute("SELECT * FROM users WHERE username=?", (query.lower(),)).fetchone()
+    if r:
+        results.append(dict(r))
+    # Par licence
+    if not results:
+        r = conn.execute("SELECT * FROM users WHERE license_key=?", (query.upper(),)).fetchone()
+        if r:
+            results.append(dict(r))
+    # Par Discord ID
+    if not results:
+        rows = conn.execute("SELECT * FROM users WHERE discord_id=?", (query,)).fetchall()
+        results.extend(dict(row) for row in rows)
+    # Par IP
+    if not results:
+        rows = conn.execute("SELECT * FROM users WHERE ip=?", (query,)).fetchall()
+        results.extend(dict(row) for row in rows)
+    # Par N° commande
+    if not results:
+        order = conn.execute("SELECT * FROM shop_orders WHERE order_id=?", (query.upper(),)).fetchone()
+        if order and order["username"]:
+            r = conn.execute("SELECT * FROM users WHERE username=?", (order["username"],)).fetchone()
+            if r:
+                o_dict = dict(r)
+                o_dict["order_id"] = order["order_id"]
+                results.append(o_dict)
+    conn.close()
+    # Masquer les mots de passe
+    for u in results:
+        u.pop("password_hash", None)
+        u.pop("temp_password", None)
+    return jsonify(results if results else {"error": "Introuvable"})
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  PANEL ADMIN — Section SITE
+# ─────────────────────────────────────────────────────────────────────────────
+# ─── CHATBOT API ─────────────────────────────────────────────────────────────
+@app.route("/api/chatbot", methods=["POST"])
+def api_chatbot():
+    if get_site_setting("chatbot_enabled","1") != "1":
+        return jsonify({"response": "Le chatbot est temporairement désactivé."})
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message","") or "").strip().lower()
+    ip = get_real_ip()
+    if not message:
+        return jsonify({"response": "Je n'ai pas reçu ta question 🤔"})
+
+    conn = get_db()
+    qas = conn.execute("SELECT * FROM chatbot_qa WHERE active=1").fetchall()
+    discord_link = get_site_setting("discord_invite", DISCORD_INVITE)
+
+    best_match = None
+    best_score = 0
+    for qa in qas:
+        keywords = (qa["keywords"] or "").lower().split()
+        score = sum(1 for kw in keywords if kw in message)
+        if score > best_score:
+            best_score = score
+            best_match = qa
+
+    if best_match and best_score >= 1:
+        response = best_match["response"]
+        try:
+            conn.execute("UPDATE chatbot_qa SET hits=hits+1 WHERE id=?", (best_match["id"],))
+        except: pass
+    else:
+        response = f"Je n'ai pas bien compris ta question 🤔\n\nTu peux me demander :\n• 💰 Les **tarifs** et plans\n• ⚡ Les **performances** et résultats\n• 🛠️ Les questions **techniques**\n• 👤 Ton **compte** et accès\n\nOu rejoins notre [Discord]({discord_link}) pour parler à l'équipe !"
+
+    try:
+        conn.execute("INSERT INTO chatbot_sessions (session_id,ip,message,response,ts) VALUES (?,?,?,?,?)",
+                     (secrets.token_hex(8), ip, message[:500], response[:500], int(time.time())))
+        conn.commit()
+    except: pass
+    conn.close()
+    return jsonify({"response": response})
+
+# ─── ADMIN SITE PANEL (VERSION ÉTENDUE) ──────────────────────────────────────
+@app.route("/admin/site")
+@admin_required
+def admin_site():
+    tab = request.args.get("tab","overview")
+    conn = get_db()
+    try:
+        orders = conn.execute("SELECT * FROM shop_orders ORDER BY created_at DESC LIMIT 50").fetchall()
+        promos = conn.execute("SELECT * FROM promo_codes ORDER BY created_at DESC").fetchall()
+        total_orders   = conn.execute("SELECT COUNT(*) FROM shop_orders").fetchone()[0]
+        pending_orders = conn.execute("SELECT COUNT(*) FROM shop_orders WHERE status='pending'").fetchone()[0]
+        total_revenue  = conn.execute("SELECT SUM(price) FROM shop_orders WHERE status='completed'").fetchone()[0] or 0
+        products = conn.execute("SELECT * FROM site_products ORDER BY sort_order").fetchall()
+        faq_rows = conn.execute("SELECT * FROM site_faq ORDER BY sort_order").fetchall()
+        testimonials = conn.execute("SELECT * FROM site_testimonials ORDER BY created_at DESC").fetchall()
+        chatbot_qas = conn.execute("SELECT * FROM chatbot_qa ORDER BY hits DESC").fetchall()
+        chat_sessions = [dict(r) for r in conn.execute("SELECT * FROM chatbot_sessions ORDER BY ts DESC LIMIT 30").fetchall()]
+        # Visits last 7 days
+        week_ago = int(time.time()) - 7*86400
+        visits_total = conn.execute("SELECT COUNT(*) FROM site_stats WHERE ts>?", (week_ago,)).fetchone()[0]
+        visits_today = conn.execute("SELECT COUNT(*) FROM site_stats WHERE ts>?", (int(time.time())-86400,)).fetchone()[0]
+    except Exception as e:
+        orders=promos=products=faq_rows=testimonials=chatbot_qas=chat_sessions=[]
+        total_orders=pending_orders=0; total_revenue=0; visits_total=visits_today=0
+    conn.close()
+
+    settings = {
+        "exe_url_normal": get_site_setting("exe_url_normal"),
+        "exe_url_pro":    get_site_setting("exe_url_pro"),
+        "stock_normal":   get_site_setting("stock_normal","999"),
+        "stock_pro":      get_site_setting("stock_pro","999"),
+        "product_normal_active": get_site_setting("product_normal_active","1"),
+        "product_pro_active":    get_site_setting("product_pro_active","1"),
+        "discord_invite": get_site_setting("discord_invite", DISCORD_INVITE),
+        "site_maintenance": get_site_setting("site_maintenance","0"),
+        "site_title": get_site_setting("site_title","WinOptimizer Pro"),
+        "site_tagline": get_site_setting("site_tagline","Optimise ton Windows pour des FPS max"),
+        "site_description": get_site_setting("site_description",""),
+        "hero_badge": get_site_setting("hero_badge","⚡ +5000 utilisateurs satisfaits"),
+        "stat1_val": get_site_setting("stat1_val","+97"), "stat1_label": get_site_setting("stat1_label","Optimisations"),
+        "stat2_val": get_site_setting("stat2_val","+25"), "stat2_label": get_site_setting("stat2_label","Jeux supportés"),
+        "stat3_val": get_site_setting("stat3_val","-30ms"), "stat3_label": get_site_setting("stat3_label","Latence réseau"),
+        "stat4_val": get_site_setting("stat4_val","+15%"), "stat4_label": get_site_setting("stat4_label","FPS moyens"),
+        "price_normal": get_site_setting("price_normal","4.99"),
+        "price_pro": get_site_setting("price_pro","9.99"),
+        "chatbot_enabled": get_site_setting("chatbot_enabled","1"),
+        "chatbot_name": get_site_setting("chatbot_name","OptBot"),
+        "chatbot_avatar": get_site_setting("chatbot_avatar","🤖"),
+        "chatbot_welcome": get_site_setting("chatbot_welcome","Salut ! Comment puis-je t'aider ?"),
+        "reviews_enabled": get_site_setting("reviews_enabled","1"),
+        "faq_enabled": get_site_setting("faq_enabled","1"),
+        "announcement_bar": get_site_setting("announcement_bar","0"),
+        "announcement_text": get_site_setting("announcement_text",""),
+        "announcement_color": get_site_setting("announcement_color","blue"),
+    }
+
+    def sel(val, opt): return "selected" if val == opt else ""
+    def chk(val, opt): return "selected" if val == opt else ""
+
+    # ── Tab styles
+    tab_style = lambda t: "border-bottom:2px solid var(--blue);color:var(--text);font-weight:700" if tab==t else "border-bottom:2px solid transparent;color:var(--text2)"
+    tabs_html = f"""
+<div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none">
+  {''.join(f'<a href="/admin/site?tab={t}" style="padding:10px 18px;font-size:13px;cursor:pointer;white-space:nowrap;{tab_style(t)}">{label}</a>'
+    for t,label in [("overview","📊 Vue d'ensemble"),("content","✏️ Contenu"),("products","📦 Produits"),
+                    ("orders","🛒 Commandes"),("promos","🎁 Promos"),("faq","❓ FAQ"),
+                    ("reviews","⭐ Avis"),("chatbot","🤖 Chatbot"),("clients","👤 Espace Clients"),("stats","📈 Stats")])}
+</div>"""
+
+    # ── TAB: OVERVIEW
+    if tab == "overview":
+        orders_rows = ""
+        for o in orders[:10]:
+            sc = {"completed":"var(--green)","pending":"var(--gold)","cancelled":"var(--red)"}.get(o["status"],"var(--text2)")
+            orders_rows += f"""<tr>
+              <td><code style="color:var(--blue);font-size:11px">{o['order_id']}</code></td>
+              <td style="font-size:12px">{o['email']}</td>
+              <td>{'⭐' if o['plan']=='PRO' else '🔷'} {o['plan']}</td>
+              <td>{o['price']:.2f}€</td>
+              <td style="color:{sc}">{o['status']}</td>
+              <td style="font-size:11px">{datetime.fromtimestamp(o['created_at']).strftime('%d/%m %H:%M')}</td>
+              <td><form method="POST" action="/admin/site/order/{o['order_id']}/complete" style="display:inline">
+                <button class="btn btn-ghost btn-sm" {'disabled' if o["status"]=="completed" else ''}>✅</button>
+              </form></td>
+            </tr>"""
+        body = f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px">
+  <div class="card"><div style="color:var(--text2);font-size:11px">COMMANDES</div><div style="font-size:26px;font-weight:800">{total_orders}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">EN ATTENTE</div><div style="font-size:26px;font-weight:800;color:var(--gold)">{pending_orders}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">REVENUS</div><div style="font-size:26px;font-weight:800;color:var(--green)">{total_revenue:.2f}€</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">VISITES 24H</div><div style="font-size:26px;font-weight:800;color:var(--accent)">{visits_today}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">VISITES 7J</div><div style="font-size:26px;font-weight:800;color:var(--purple)">{visits_total}</div></div>
+</div>
+<div class="card">
+  <div class="card-title">🛒 Dernières commandes</div>
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead><tr><th>N°</th><th>Email</th><th>Plan</th><th>Prix</th><th>Statut</th><th>Date</th><th>Action</th></tr></thead>
+      <tbody>{orders_rows or '<tr><td colspan="7" style="text-align:center;color:var(--text2)">Aucune commande</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>"""
+
+    # ── TAB: CONTENT
+    elif tab == "content":
+        color_opts = "".join(f'<option value="{c}" {sel(settings["announcement_color"],c)}>{c}</option>' for c in ["blue","green","red","gold","purple"])
+        body = f"""
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">🌐 Informations générales du site</div>
+  <form method="POST" action="/admin/site/settings">
+    <input type="hidden" name="_tab" value="content">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+      <div class="form-group"><label>Nom du site</label><input name="site_title" value="{settings['site_title']}"></div>
+      <div class="form-group"><label>Lien Discord</label><input name="discord_invite" value="{settings['discord_invite']}"></div>
+    </div>
+    <div class="form-group"><label>Slogan hero (h1)</label><input name="site_tagline" value="{settings['site_tagline']}"></div>
+    <div class="form-group"><label>Description hero (sous-titre)</label><textarea name="site_description" rows="2" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text)">{settings['site_description']}</textarea></div>
+    <div class="form-group"><label>Badge hero (ex: ⚡ +5000 utilisateurs)</label><input name="hero_badge" value="{settings['hero_badge']}"></div>
+    <div class="card-title" style="margin:16px 0 10px">📊 Statistiques hero</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px">
+      <div class="form-group"><label>Stat 1 valeur</label><input name="stat1_val" value="{settings['stat1_val']}"></div>
+      <div class="form-group"><label>Stat 1 label</label><input name="stat1_label" value="{settings['stat1_label']}"></div>
+      <div class="form-group"><label>Stat 2 valeur</label><input name="stat2_val" value="{settings['stat2_val']}"></div>
+      <div class="form-group"><label>Stat 2 label</label><input name="stat2_label" value="{settings['stat2_label']}"></div>
+      <div class="form-group"><label>Stat 3 valeur</label><input name="stat3_val" value="{settings['stat3_val']}"></div>
+      <div class="form-group"><label>Stat 3 label</label><input name="stat3_label" value="{settings['stat3_label']}"></div>
+      <div class="form-group"><label>Stat 4 valeur</label><input name="stat4_val" value="{settings['stat4_val']}"></div>
+      <div class="form-group"><label>Stat 4 label</label><input name="stat4_label" value="{settings['stat4_label']}"></div>
+    </div>
+    <div class="card-title" style="margin:16px 0 10px">📢 Barre d'annonce</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:10px;align-items:end">
+      <div class="form-group"><label>Activer</label><select name="announcement_bar"><option value="1" {sel(settings['announcement_bar'],'1')}>✅ Oui</option><option value="0" {sel(settings['announcement_bar'],'0')}>🔴 Non</option></select></div>
+      <div class="form-group"><label>Couleur</label><select name="announcement_color">{color_opts}</select></div>
+      <div class="form-group"><label>Message</label><input name="announcement_text" value="{settings['announcement_text']}" placeholder="Nouvelle mise à jour disponible !"></div>
+    </div>
+    <div class="card-title" style="margin:16px 0 10px">⚙️ Autres paramètres</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+      <div class="form-group"><label>Afficher les avis</label><select name="reviews_enabled"><option value="1" {sel(settings['reviews_enabled'],'1')}>✅ Oui</option><option value="0" {sel(settings['reviews_enabled'],'0')}>Non</option></select></div>
+      <div class="form-group"><label>Afficher la FAQ</label><select name="faq_enabled"><option value="1" {sel(settings['faq_enabled'],'1')}>✅ Oui</option><option value="0" {sel(settings['faq_enabled'],'0')}>Non</option></select></div>
+      <div class="form-group"><label>Mode maintenance</label><select name="site_maintenance"><option value="0" {sel(settings['site_maintenance'],'0')}>🟢 En ligne</option><option value="1" {sel(settings['site_maintenance'],'1')}>🔴 Maintenance</option></select></div>
+      <div class="form-group"><label>Message de maintenance</label><input name="maintenance_site_msg" value="{get_site_setting('maintenance_site_msg','Nous revenons très bientôt.')}" placeholder="Message affiché pendant la maintenance"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="form-group"><label>🔷 Lien .exe NORMAL</label><input name="exe_url_normal" value="{settings['exe_url_normal']}" placeholder="https://..."></div>
+      <div class="form-group"><label>⭐ Lien .exe PRO</label><input name="exe_url_pro" value="{settings['exe_url_pro']}" placeholder="https://..."></div>
+    </div>
+    <button type="submit" class="btn btn-blue btn-sm">💾 Sauvegarder</button>
+  </form>
+</div>"""
+
+    # ── TAB: PRODUCTS
+    elif tab == "products":
+        prod_rows = ""
+        for p in products:
+            feats_preview = (p["features"] or "").replace("|"," · ")[:80]
+            prod_rows += f"""<tr>
+              <td>{'⭐' if p['plan']=='PRO' else '🔷'} {p['name']}</td>
+              <td style="font-weight:700;color:var(--green)">{p['price']:.2f}€</td>
+              <td style="font-size:11px;color:var(--text2)">{feats_preview}…</td>
+              <td style="color:{'var(--green)' if p['active'] else 'var(--red)'}">{'Actif' if p['active'] else 'Inactif'}</td>
+              <td>
+                <button onclick="editProduct({p['id']},'{p['plan']}','{p['name']}',{p['price']},'{(p['description'] or '').replace(chr(39), chr(39)+chr(39))}','{(p['features'] or '').replace(chr(39),chr(39)+chr(39))}','{p['badge'] or ''}',{p['active']})" class="btn btn-ghost btn-sm">✏️</button>
+                <form method="POST" action="/admin/site/product/{p['id']}/toggle" style="display:inline"><button class="btn btn-ghost btn-sm">{'🔴' if p['active'] else '🟢'}</button></form>
+              </td>
+            </tr>"""
+        body = f"""
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">➕ Ajouter un produit</div>
+  <form method="POST" action="/admin/site/product/create">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+      <div class="form-group"><label>Nom</label><input name="name" placeholder="ELITE" required></div>
+      <div class="form-group"><label>Plan (clé)</label><select name="plan"><option value="NORMAL">NORMAL</option><option value="PRO">PRO</option><option value="ELITE">ELITE</option></select></div>
+      <div class="form-group"><label>Prix (€)</label><input name="price" type="number" step="0.01" value="4.99" required></div>
+    </div>
+    <div class="form-group"><label>Description courte</label><input name="description" placeholder="Description affichée sous le prix"></div>
+    <div class="form-group"><label>Fonctionnalités (séparées par |)</label><input name="features" placeholder="Feat 1|Feat 2|Feat 3"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+      <div class="form-group"><label>Badge (vide si aucun)</label><input name="badge" placeholder="⭐ LE PLUS POPULAIRE"></div>
+      <div class="form-group"><label>Actif</label><select name="active"><option value="1">✅ Oui</option><option value="0">Non</option></select></div>
+      <div class="form-group"><label>Ordre d'affichage</label><input name="sort_order" type="number" value="1"></div>
+    </div>
+    <button type="submit" class="btn btn-blue btn-sm">➕ Créer le produit</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">📦 Produits existants</div>
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead><tr><th>Nom</th><th>Prix</th><th>Fonctionnalités</th><th>Statut</th><th>Actions</th></tr></thead>
+      <tbody>{prod_rows or '<tr><td colspan="5" style="text-align:center;color:var(--text2)">Aucun produit</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal edit produit -->
+<div id="edit-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;align-items:center;justify-content:center;padding:20px">
+  <div style="background:var(--bg);border:1px solid var(--border);border-radius:16px;padding:28px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto">
+    <div style="font-size:16px;font-weight:800;margin-bottom:16px">✏️ Modifier le produit</div>
+    <form method="POST" id="edit-form">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div class="form-group"><label>Nom</label><input name="name" id="e-name" required></div>
+        <div class="form-group"><label>Prix (€)</label><input name="price" id="e-price" type="number" step="0.01" required></div>
+      </div>
+      <div class="form-group"><label>Description courte</label><input name="description" id="e-desc"></div>
+      <div class="form-group"><label>Fonctionnalités (séparées par |)</label><textarea name="features" id="e-feats" rows="4" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text)"></textarea></div>
+      <div class="form-group"><label>Badge</label><input name="badge" id="e-badge"></div>
+      <div class="form-group"><label>Actif</label><select name="active" id="e-active"><option value="1">✅ Oui</option><option value="0">Non</option></select></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button type="submit" class="btn btn-blue btn-sm">💾 Sauvegarder</button>
+        <button type="button" onclick="document.getElementById('edit-modal').style.display='none'" class="btn btn-ghost btn-sm">Annuler</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function editProduct(id,plan,name,price,desc,feats,badge,active){{
+  document.getElementById('e-name').value=name;
+  document.getElementById('e-price').value=price;
+  document.getElementById('e-desc').value=desc;
+  document.getElementById('e-feats').value=feats.replace(/\\|/g,'\\n');
+  document.getElementById('e-badge').value=badge;
+  document.getElementById('e-active').value=active;
+  document.getElementById('edit-form').action='/admin/site/product/'+id+'/edit';
+  document.getElementById('edit-modal').style.display='flex';
+}}
+</script>"""
+
+    # ── TAB: ORDERS
+    elif tab == "orders":
+        orders_rows = ""
+        for o in orders:
+            sc = {"completed":"var(--green)","pending":"var(--gold)","cancelled":"var(--red)"}.get(o["status"],"var(--text2)")
+            orders_rows += f"""<tr>
+              <td><code style="color:var(--blue);font-size:11px">{o['order_id']}</code></td>
+              <td style="font-size:12px">{o['email']}</td>
+              <td>{'⭐' if o['plan']=='PRO' else '🔷'} {o['plan']}</td>
+              <td>{o['price']:.2f}€</td>
+              <td style="color:{sc}">{o['status']}</td>
+              <td style="font-size:11px">{o.get('payment_method','?')}</td>
+              <td style="font-size:11px">{datetime.fromtimestamp(o['created_at']).strftime('%d/%m %H:%M')}</td>
+              <td style="display:flex;gap:4px">
+                <form method="POST" action="/admin/site/order/{o['order_id']}/complete" style="display:inline"><button class="btn btn-ghost btn-sm" {'disabled' if o["status"]=="completed" else ''}>✅</button></form>
+                <form method="POST" action="/admin/site/order/{o['order_id']}/cancel" style="display:inline"><button class="btn btn-ghost btn-sm" {'disabled' if o["status"]!="pending" else ''}>❌</button></form>
+              </td>
+            </tr>"""
+        body = f"""
+<div class="card">
+  <div class="card-title">🛒 Toutes les commandes ({total_orders})</div>
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead><tr><th>N°</th><th>Email</th><th>Plan</th><th>Prix</th><th>Statut</th><th>Paiement</th><th>Date</th><th>Actions</th></tr></thead>
+      <tbody>{orders_rows or '<tr><td colspan="8" style="text-align:center;color:var(--text2)">Aucune commande</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>"""
+
+    # ── TAB: PROMOS
+    elif tab == "promos":
+        promos_rows = ""
+        for p in promos:
+            promos_rows += f"""<tr>
+              <td><code style="color:var(--blue)">{p['code']}</code></td>
+              <td>-{p['reduction']}%</td>
+              <td>{p['plan']}</td>
+              <td>{p['uses']}{' / '+str(p['max_uses']) if p['max_uses'] else ' / ∞'}</td>
+              <td style="color:{'var(--green)' if p['active'] else 'var(--red)'}">{'Actif' if p['active'] else 'Inactif'}</td>
+              <td>
+                <form method="POST" action="/admin/site/promo/{p['id']}/toggle" style="display:inline"><button class="btn btn-ghost btn-sm">{'🔴' if p['active'] else '🟢'}</button></form>
+                <form method="POST" action="/admin/site/promo/{p['id']}/delete" style="display:inline" onsubmit="return confirm('Supprimer ?')"><button class="btn btn-ghost btn-sm">🗑️</button></form>
+              </td>
+            </tr>"""
+        body = f"""
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">➕ Créer un code promo</div>
+  <form method="POST" action="/admin/site/promo/create" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+    <div class="form-group" style="flex:1;min-width:100px"><label>Code</label><input name="code" placeholder="SUMMER10"></div>
+    <div class="form-group" style="width:80px"><label>Réduction %</label><input name="reduction" type="number" value="10"></div>
+    <div class="form-group" style="width:100px"><label>Plan</label><select name="plan"><option value="ALL">ALL</option><option value="NORMAL">NORMAL</option><option value="PRO">PRO</option></select></div>
+    <div class="form-group" style="width:80px"><label>Max utilisations</label><input name="max_uses" type="number" value="0" placeholder="0=∞"></div>
+    <button type="submit" class="btn btn-blue btn-sm" style="margin-bottom:16px">Créer</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">🎁 Codes promo</div>
+  <table class="table">
+    <thead><tr><th>Code</th><th>Réduction</th><th>Plan</th><th>Utilisations</th><th>Statut</th><th>Actions</th></tr></thead>
+    <tbody>{promos_rows or '<tr><td colspan="6" style="text-align:center;color:var(--text2)">Aucun code</td></tr>'}</tbody>
+  </table>
+</div>"""
+
+    # ── TAB: FAQ
+    elif tab == "faq":
+        faq_table = ""
+        for f in faq_rows:
+            faq_table += f"""<tr>
+              <td style="font-size:13px;font-weight:600">{f['question'][:60]}</td>
+              <td style="font-size:12px;color:var(--text2)">{f['answer'][:60]}…</td>
+              <td><span style="background:rgba(79,142,247,.15);color:var(--accent);padding:2px 8px;border-radius:4px;font-size:11px">{f['category']}</span></td>
+              <td style="color:{'var(--green)' if f['active'] else 'var(--red)'}">{'✅' if f['active'] else '🔴'}</td>
+              <td style="display:flex;gap:4px">
+                <form method="POST" action="/admin/site/faq/{f['id']}/toggle" style="display:inline"><button class="btn btn-ghost btn-sm">{'🔴' if f['active'] else '🟢'}</button></form>
+                <form method="POST" action="/admin/site/faq/{f['id']}/delete" style="display:inline" onsubmit="return confirm('Supprimer ?')"><button class="btn btn-ghost btn-sm">🗑️</button></form>
+              </td>
+            </tr>"""
+        body = f"""
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">➕ Ajouter une question FAQ</div>
+  <form method="POST" action="/admin/site/faq/create">
+    <div class="form-group"><label>Question</label><input name="question" placeholder="Comment acheter ?" required></div>
+    <div class="form-group"><label>Réponse</label><textarea name="answer" rows="3" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text)" placeholder="Réponse complète..." required></textarea></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="form-group"><label>Catégorie</label><input name="category" value="general" placeholder="general / achat / technique / compte"></div>
+      <div class="form-group"><label>Ordre d'affichage</label><input name="sort_order" type="number" value="{len(faq_rows)+1}"></div>
+    </div>
+    <button type="submit" class="btn btn-blue btn-sm">➕ Ajouter</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">❓ Questions FAQ ({len(faq_rows)})</div>
+  <table class="table">
+    <thead><tr><th>Question</th><th>Réponse</th><th>Catégorie</th><th>Statut</th><th>Actions</th></tr></thead>
+    <tbody>{faq_table or '<tr><td colspan="5" style="text-align:center;color:var(--text2)">Aucune FAQ</td></tr>'}</tbody>
+  </table>
+</div>"""
+
+    # ── TAB: REVIEWS
+    elif tab == "reviews":
+        rev_table = ""
+        for t in testimonials:
+            stars = "⭐" * int(t["rating"])
+            rev_table += f"""<tr>
+              <td>{t['avatar'] or '👤'} {t['author']}</td>
+              <td style="font-size:12px;color:var(--text2)">{t['content'][:60]}…</td>
+              <td>{stars}</td>
+              <td style="color:var(--text2);font-size:12px">{t['game'] or '—'}</td>
+              <td style="color:{'var(--green)' if t['active'] else 'var(--red)'}">{'✅' if t['active'] else '🔴'}</td>
+              <td style="display:flex;gap:4px">
+                <form method="POST" action="/admin/site/review/{t['id']}/toggle" style="display:inline"><button class="btn btn-ghost btn-sm">{'🔴' if t['active'] else '🟢'}</button></form>
+                <form method="POST" action="/admin/site/review/{t['id']}/delete" style="display:inline" onsubmit="return confirm('Supprimer ?')"><button class="btn btn-ghost btn-sm">🗑️</button></form>
+              </td>
+            </tr>"""
+        body = f"""
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">➕ Ajouter un avis</div>
+  <form method="POST" action="/admin/site/review/create">
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+      <div class="form-group"><label>Pseudo</label><input name="author" placeholder="GamerPro" required></div>
+      <div class="form-group"><label>Jeu</label><input name="game" placeholder="Valorant"></div>
+      <div class="form-group"><label>Avatar (emoji)</label><input name="avatar" placeholder="🎮"></div>
+    </div>
+    <div class="form-group"><label>Avis</label><textarea name="content" rows="2" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text)" required placeholder="Excellent logiciel, +30 FPS sur CS2 !"></textarea></div>
+    <div class="form-group"><label>Note</label><select name="rating"><option value="5">⭐⭐⭐⭐⭐ 5/5</option><option value="4">⭐⭐⭐⭐ 4/5</option><option value="3">⭐⭐⭐ 3/5</option></select></div>
+    <button type="submit" class="btn btn-blue btn-sm">➕ Ajouter l'avis</button>
+  </form>
+</div>
+<div class="card">
+  <div class="card-title">⭐ Avis clients ({len(testimonials)})</div>
+  <table class="table">
+    <thead><tr><th>Auteur</th><th>Avis</th><th>Note</th><th>Jeu</th><th>Statut</th><th>Actions</th></tr></thead>
+    <tbody>{rev_table or '<tr><td colspan="6" style="text-align:center;color:var(--text2)">Aucun avis</td></tr>'}</tbody>
+  </table>
+</div>"""
+
+    # ── TAB: CHATBOT
+    elif tab == "chatbot":
+        qa_table = ""
+        for q in chatbot_qas:
+            qa_table += f"""<tr>
+              <td style="font-size:11px;color:var(--text2)">{q['keywords'][:50]}</td>
+              <td style="font-size:12px">{q['response'][:60]}…</td>
+              <td><span style="background:rgba(79,142,247,.15);color:var(--accent);padding:2px 8px;border-radius:4px;font-size:11px">{q['category']}</span></td>
+              <td style="color:var(--text2)">{q['hits']}</td>
+              <td style="color:{'var(--green)' if q['active'] else 'var(--red)'}">{'✅' if q['active'] else '🔴'}</td>
+              <td style="display:flex;gap:4px">
+                <form method="POST" action="/admin/site/chatbot/{q['id']}/toggle" style="display:inline"><button class="btn btn-ghost btn-sm">{'🔴' if q['active'] else '🟢'}</button></form>
+                <form method="POST" action="/admin/site/chatbot/{q['id']}/delete" style="display:inline" onsubmit="return confirm('Supprimer ?')"><button class="btn btn-ghost btn-sm">🗑️</button></form>
+              </td>
+            </tr>"""
+
+        chat_log = ""
+        for c in chat_sessions:
+            ts_str = datetime.fromtimestamp(c['ts']).strftime('%d/%m %H:%M') if c.get('ts') else '?'
+            chat_log += f"""<tr>
+              <td style="font-size:11px;color:var(--text2)">{ts_str}</td>
+              <td style="font-size:11px;color:var(--text2)">{c['ip'] or '?'}</td>
+              <td style="font-size:12px">👤 {c['message'][:50]}</td>
+              <td style="font-size:12px;color:var(--text2)">🤖 {c['response'][:50]}…</td>
+            </tr>"""
+
+        body = f"""
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">⚙️ Paramètres chatbot</div>
+  <form method="POST" action="/admin/site/settings">
+    <input type="hidden" name="_tab" value="chatbot">
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px">
+      <div class="form-group"><label>Chatbot actif</label><select name="chatbot_enabled"><option value="1" {sel(settings['chatbot_enabled'],'1')}>✅ Oui</option><option value="0" {sel(settings['chatbot_enabled'],'0')}>🔴 Non</option></select></div>
+      <div class="form-group"><label>Nom du bot</label><input name="chatbot_name" value="{settings['chatbot_name']}"></div>
+      <div class="form-group"><label>Avatar (emoji)</label><input name="chatbot_avatar" value="{settings['chatbot_avatar']}"></div>
+    </div>
+    <div class="form-group"><label>Message de bienvenue</label><input name="chatbot_welcome" value="{settings['chatbot_welcome']}"></div>
+    <button type="submit" class="btn btn-blue btn-sm">💾 Sauvegarder</button>
+  </form>
+</div>
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">➕ Ajouter une réponse automatique</div>
+  <form method="POST" action="/admin/site/chatbot/create">
+    <div class="form-group"><label>Mots-clés déclencheurs (séparés par des espaces)</label><input name="keywords" placeholder="prix tarif coût combien" required></div>
+    <div class="form-group"><label>Réponse (Markdown supporté: **gras**, [lien](url))</label><textarea name="response" rows="4" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text)" required placeholder="La réponse qui sera affichée..."></textarea></div>
+    <div class="form-group"><label>Catégorie</label><input name="category" value="general" placeholder="general / achat / technique / compte"></div>
+    <button type="submit" class="btn btn-blue btn-sm">➕ Ajouter la réponse</button>
+  </form>
+</div>
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">🤖 Réponses automatiques ({len(chatbot_qas)})</div>
+  <table class="table">
+    <thead><tr><th>Mots-clés</th><th>Réponse</th><th>Catégorie</th><th>Hits</th><th>Statut</th><th>Actions</th></tr></thead>
+    <tbody>{qa_table or '<tr><td colspan="6" style="text-align:center;color:var(--text2)">Aucune réponse configurée</td></tr>'}</tbody>
+  </table>
+</div>
+<div class="card">
+  <div class="card-title">💬 Logs conversations récentes ({len(chat_sessions)})</div>
+  <table class="table">
+    <thead><tr><th>Date</th><th>IP</th><th>Message</th><th>Réponse</th></tr></thead>
+    <tbody>{chat_log or '<tr><td colspan="4" style="text-align:center;color:var(--text2)">Aucune conversation</td></tr>'}</tbody>
+  </table>
+</div>"""
+
+    # ── TAB: CLIENTS ESPACE
+    elif tab == "clients":
+        conn3 = get_db()
+        try:
+            # Tous les users avec infos enrichies
+            all_users = conn3.execute("""SELECT u.username, u.plan, u.status, u.created_at, u.last_login,
+                u.connections, u.ip, u.discord_id, u.hwid, u.os_info, u.license_key,
+                (SELECT COUNT(*) FROM tickets WHERE user=u.username) as ticket_count,
+                (SELECT COUNT(*) FROM tickets WHERE user=u.username AND status='open') as open_tickets,
+                (SELECT COUNT(*) FROM tickets WHERE user=u.username AND status='answered') as ans_tickets
+                FROM users u ORDER BY u.created_at DESC LIMIT 100""").fetchall()
+            total_clients = conn3.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            active_clients = conn3.execute("SELECT COUNT(*) FROM users WHERE status='active'").fetchone()[0]
+            banned_clients = conn3.execute("SELECT COUNT(*) FROM users WHERE status='banned'").fetchone()[0]
+            recent_logins = conn3.execute("SELECT COUNT(*) FROM users WHERE last_login>?",
+                (int(time.time())-86400,)).fetchone()[0]
+            # All tickets linked to client space
+            client_tickets = conn3.execute("""SELECT t.*, u.plan as user_plan FROM tickets t
+                LEFT JOIN users u ON t.user=u.username
+                ORDER BY t.created_at DESC LIMIT 50""").fetchall()
+        except Exception as ex:
+            all_users=[]; total_clients=active_clients=banned_clients=recent_logins=0; client_tickets=[]
+        conn3.close()
+
+        user_rows = ""
+        for u in all_users:
+            plan_b = '⭐ PRO' if u['plan']=='PRO' else '🔷 NORMAL'
+            status_color = {"active":"var(--green)","banned":"var(--red)","suspended":"var(--gold)"}.get(u["status"],"var(--text2)")
+            last_login_str = datetime.fromtimestamp(u["last_login"]).strftime("%d/%m %H:%M") if u["last_login"] else "—"
+            ticket_badge = f'<span style="color:var(--gold);font-size:11px">🎫 {u["open_tickets"]}</span>' if u["open_tickets"] else ""
+            uname = u["username"]
+            is_banned = u["status"] == "banned"
+            dis_ban = "disabled" if is_banned else ""
+            dis_unban = "disabled" if not is_banned else ""
+            user_rows += (
+                f'<tr>'
+                f'<td><a href="/admin/user/{uname}" style="font-weight:700;color:var(--accent)">{uname}</a> {ticket_badge}</td>'
+                f'<td>{plan_b}</td>'
+                f'<td style="color:{status_color};font-size:12px">{u["status"]}</td>'
+                f'<td style="font-size:11px;color:var(--text2)">{last_login_str}</td>'
+                f'<td style="font-size:12px">{u["connections"] or 0}</td>'
+                f'<td style="font-size:11px;color:var(--text2)">{u["ip"] or "—"}</td>'
+                f'<td style="font-size:11px">{u["ticket_count"]}</td>'
+                f'<td style="display:flex;gap:3px">'
+                f'<form method="POST" action="/admin/site/client/{uname}/reset_password" style="display:inline">'
+                f'<button class="btn btn-ghost btn-sm" title="Reset mdp">🔑</button></form>'
+                f'<form method="POST" action="/admin/site/client/{uname}/reset_hwid" style="display:inline">'
+                f'<button class="btn btn-ghost btn-sm" title="Reset HWID" onclick="return confirm(\'Reset HWID ?\')">🖥️</button></form>'
+                f'<form method="POST" action="/admin/site/client/{uname}/ban" style="display:inline">'
+                f'<button class="btn btn-ghost btn-sm" title="Bannir" {dis_ban} onclick="return confirm(\'Bannir ?\')">🚫</button></form>'
+                f'<form method="POST" action="/admin/site/client/{uname}/unban" style="display:inline">'
+                f'<button class="btn btn-ghost btn-sm" title="Débannir" {dis_unban}>✅</button></form>'
+                f'</td></tr>'
+            )
+
+        # Tickets panel
+        ticket_rows = ""
+        for t in client_tickets:
+            sc_color = {"open":"var(--gold)","answered":"var(--accent)","closed":"var(--text2)"}.get(t["status"],"var(--text2)")
+            sc_label = {"open":"🟡 Ouvert","answered":"💬 Répondu","closed":"✅ Fermé"}.get(t["status"],t["status"])
+            prio_color = {"urgent":"var(--red)","high":"var(--gold)"}.get(t["priority"],"var(--text2)")
+            date_str = datetime.fromtimestamp(t["created_at"]).strftime("%d/%m %H:%M")
+            safe_msg = (t["message"] or "")[:300].replace("'","&#39;").replace('"','&quot;').replace('<','&lt;')
+            safe_resp = (t["response"] or "").replace("'","&#39;").replace('"','&quot;').replace('<','&lt;')
+            ticket_rows += f"""<tr>
+              <td style="font-weight:700">#{t['id']}</td>
+              <td><a href="/admin/user/{t['user'] or ''}" style="color:var(--accent)">{t['user'] or '?'}</a>
+                {f'<span style="font-size:10px;color:var(--text2)">({t["user_plan"]})</span>' if t.get("user_plan") else ''}</td>
+              <td style="font-size:12px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{t['subject']}</td>
+              <td style="color:{sc_color};font-size:12px">{sc_label}</td>
+              <td style="color:{prio_color};font-size:11px">{t['priority'].upper()}</td>
+              <td style="font-size:11px;color:var(--text2)">{date_str}</td>
+              <td>
+                <button onclick="openClientTicket({t['id']},'{t['user'] or ''}','{safe_msg}','{safe_resp}')"
+                  class="btn btn-ghost btn-sm">{'📩 Répondre' if t['status']=='open' else '👁 Voir'}</button>
+              </td>
+            </tr>"""
+
+        body = f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px">
+  <div class="card"><div style="color:var(--text2);font-size:11px">TOTAL CLIENTS</div><div style="font-size:24px;font-weight:800">{total_clients}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">ACTIFS</div><div style="font-size:24px;font-weight:800;color:var(--green)">{active_clients}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">BANNIS</div><div style="font-size:24px;font-weight:800;color:var(--red)">{banned_clients}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">CONNEXIONS 24H</div><div style="font-size:24px;font-weight:800;color:var(--accent)">{recent_logins}</div></div>
+</div>
+
+<div class="card" style="margin-bottom:14px">
+  <div class="card-title">👤 Clients ({len(all_users)})</div>
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead><tr><th>Username</th><th>Plan</th><th>Statut</th><th>Dernière connexion</th><th>Connexions</th><th>IP</th><th>Tickets</th><th>Actions</th></tr></thead>
+      <tbody>{user_rows or '<tr><td colspan="8" style="text-align:center;color:var(--text2)">Aucun client</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">📩 Tickets support — Espace Client ({len(client_tickets)})</div>
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead><tr><th>#</th><th>Client</th><th>Sujet</th><th>Statut</th><th>Priorité</th><th>Date</th><th>Action</th></tr></thead>
+      <tbody>{ticket_rows or '<tr><td colspan="7" style="text-align:center;color:var(--text2)">Aucun ticket</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+
+<!-- Modal réponse ticket -->
+<div id="client-ticket-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:999;align-items:center;justify-content:center;padding:16px">
+  <div style="background:var(--bg);border:1px solid var(--border);border-radius:16px;padding:24px;width:100%;max-width:560px;max-height:90vh;overflow-y:auto">
+    <div style="font-size:15px;font-weight:800;margin-bottom:4px">📩 Ticket <span id="ctm-id"></span> — <span id="ctm-user" style="color:var(--accent)"></span></div>
+    <div id="ctm-msg" style="background:var(--card2);border-radius:8px;padding:12px;color:var(--text2);font-size:13px;margin:12px 0;max-height:150px;overflow-y:auto;white-space:pre-wrap"></div>
+    <form id="ctm-form" method="POST">
+      <div class="form-group"><label>Réponse</label>
+        <textarea name="response" id="ctm-response" rows="5" style="width:100%;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;color:var(--text);font-size:13px" placeholder="Votre réponse..."></textarea>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button type="submit" name="close" value="0" class="btn btn-blue btn-sm">📩 Répondre</button>
+        <button type="submit" name="close" value="1" class="btn btn-green btn-sm">✅ Répondre & Fermer</button>
+        <button type="button" onclick="document.getElementById('client-ticket-modal').style.display='none'" class="btn btn-ghost btn-sm">Annuler</button>
+      </div>
+    </form>
+  </div>
+</div>
+<script>
+function openClientTicket(id,user,msg,resp){{
+  document.getElementById('ctm-id').textContent='#'+id;
+  document.getElementById('ctm-user').textContent=user;
+  document.getElementById('ctm-msg').innerHTML=msg;
+  document.getElementById('ctm-response').value=resp||'';
+  document.getElementById('ctm-form').action='/admin/tickets/'+id+'/reply';
+  document.getElementById('client-ticket-modal').style.display='flex';
+}}
+</script>"""
+
+    # ── TAB: STATS
+    elif tab == "stats":
+        conn2 = get_db()
+        try:
+            top_ips = conn2.execute(
+                "SELECT ip,country,city,flag,isp,is_proxy,COUNT(*) as cnt FROM site_stats WHERE ts>? GROUP BY ip ORDER BY cnt DESC LIMIT 15",
+                (week_ago,)).fetchall()
+            by_page = conn2.execute("SELECT page, COUNT(*) as cnt FROM site_stats WHERE ts>? GROUP BY page ORDER BY cnt DESC", (week_ago,)).fetchall()
+            visits_hour = conn2.execute("SELECT COUNT(*) FROM site_stats WHERE ts>?", (int(time.time())-3600,)).fetchone()[0]
+            chat_total = conn2.execute("SELECT COUNT(*) FROM chatbot_sessions").fetchone()[0]
+            chat_week = conn2.execute("SELECT COUNT(*) FROM chatbot_sessions WHERE ts>?", (week_ago,)).fetchone()[0]
+            # Top countries
+            top_countries = conn2.execute(
+                "SELECT flag,country,COUNT(*) as cnt FROM site_stats WHERE ts>? GROUP BY country ORDER BY cnt DESC LIMIT 10",
+                (week_ago,)).fetchall()
+            # Proxy visits
+            proxy_visits = conn2.execute("SELECT COUNT(*) FROM site_stats WHERE is_proxy=1 AND ts>?", (week_ago,)).fetchone()[0]
+            # Recent visits with full GeoIP
+            recent_visits = conn2.execute(
+                "SELECT ip,country,city,flag,isp,is_proxy,page,user_agent,referrer,ts FROM site_stats ORDER BY ts DESC LIMIT 30"
+            ).fetchall()
+            # Unique IPs
+            unique_ips = conn2.execute("SELECT COUNT(DISTINCT ip) FROM site_stats WHERE ts>?", (week_ago,)).fetchone()[0]
+        except Exception as ex:
+            top_ips=[]; by_page=[]; visits_hour=0; chat_total=0; chat_week=0
+            top_countries=[]; proxy_visits=0; recent_visits=[]; unique_ips=0
+        conn2.close()
+
+        pages_rows = "".join(f'<tr><td style="color:var(--accent)">{r["page"]}</td><td style="font-weight:700;text-align:right">{r["cnt"]}</td></tr>' for r in by_page)
+        countries_rows = "".join(f'<tr><td>{r["flag"]} {r["country"]}</td><td style="font-weight:700;text-align:right">{r["cnt"]}</td></tr>' for r in top_countries)
+
+        ip_rows = ""
+        for r in top_ips:
+            proxy_badge = '<span class="badge b-red" style="font-size:9px">VPN</span>' if r["is_proxy"] else ''
+            ip_rows += f"""<tr>
+              <td style="font-family:monospace;font-size:11px">{r['ip']}</td>
+              <td>{r['flag']} {r['city']}, {r['country']} {proxy_badge}</td>
+              <td style="font-size:11px;color:var(--text2)">{(r['isp'] or '')[:25]}</td>
+              <td style="font-weight:700;text-align:right">{r['cnt']}</td>
+            </tr>"""
+
+        recent_rows = ""
+        for v in recent_visits:
+            proxy_badge = '<span class="badge b-red" style="font-size:9px">VPN</span>' if v["is_proxy"] else ''
+            ua_short = (v["user_agent"] or "")[:40]
+            ref_short = (v["referrer"] or "—")[:30]
+            ts_str = datetime.fromtimestamp(v["ts"]).strftime("%d/%m %H:%M")
+            recent_rows += f"""<tr>
+              <td style="font-size:11px;color:var(--text2)">{ts_str}</td>
+              <td style="font-family:monospace;font-size:11px">{v['ip']}</td>
+              <td>{v['flag']} {v['city']}, {v['country']} {proxy_badge}</td>
+              <td style="color:var(--accent)">{v['page']}</td>
+              <td style="font-size:10px;color:var(--text2)">{ua_short}…</td>
+              <td style="font-size:10px;color:var(--text2)">{ref_short}</td>
+            </tr>"""
+
+        body = f"""
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-bottom:20px">
+  <div class="card"><div style="color:var(--text2);font-size:11px">VISITES 1H</div><div style="font-size:24px;font-weight:800;color:var(--green)">{visits_hour}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">VISITES 24H</div><div style="font-size:24px;font-weight:800;color:var(--accent)">{visits_today}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">VISITES 7J</div><div style="font-size:24px;font-weight:800;color:var(--purple)">{visits_total}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">IPs UNIQUES 7J</div><div style="font-size:24px;font-weight:800;color:var(--blue)">{unique_ips}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">VPN/PROXY 7J</div><div style="font-size:24px;font-weight:800;color:var(--red)">{proxy_visits}</div></div>
+  <div class="card"><div style="color:var(--text2);font-size:11px">MSGS CHATBOT 7J</div><div style="font-size:24px;font-weight:800;color:var(--gold)">{chat_week}</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px">
+  <div class="card">
+    <div class="card-title">📄 Pages visitées (7j)</div>
+    <table class="table">
+      <thead><tr><th>Page</th><th style="text-align:right">Visites</th></tr></thead>
+      <tbody>{pages_rows or '<tr><td colspan="2" style="text-align:center;color:var(--text2)">Aucune donnée</td></tr>'}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="card-title">🌍 Pays (7j)</div>
+    <table class="table">
+      <thead><tr><th>Pays</th><th style="text-align:right">Visites</th></tr></thead>
+      <tbody>{countries_rows or '<tr><td colspan="2" style="text-align:center;color:var(--text2)">Aucune donnée</td></tr>'}</tbody>
+    </table>
+  </div>
+  <div class="card">
+    <div class="card-title">🌐 Top IPs (7j)</div>
+    <table class="table">
+      <thead><tr><th>IP</th><th>Localisation</th><th>ISP</th><th style="text-align:right">Cnt</th></tr></thead>
+      <tbody>{ip_rows or '<tr><td colspan="4" style="text-align:center;color:var(--text2)">Aucune donnée</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-title">🔍 Visites récentes (30 dernières) avec GeoIP IPv4</div>
+  <div style="overflow-x:auto">
+    <table class="table">
+      <thead><tr><th>Date</th><th>IP</th><th>Localisation</th><th>Page</th><th>User-Agent</th><th>Referrer</th></tr></thead>
+      <tbody>{recent_rows or '<tr><td colspan="6" style="text-align:center;color:var(--text2)">Aucune donnée</td></tr>'}</tbody>
+    </table>
+  </div>
+</div>"""
+    else:
+        body = "<div class='card'>Onglet inconnu.</div>"
+
+    content = tabs_html + body
+    return _layout("🌐 Site Web", "/admin/site", content, session["admin_user"], session["admin_role"])
+
+
+@app.route("/admin/site/settings", methods=["POST"])
+@admin_required
+def admin_site_settings():
+    all_keys = [
+        "exe_url_normal","exe_url_pro","stock_normal","stock_pro",
+        "product_normal_active","product_pro_active","discord_invite","site_maintenance",
+        "site_title","site_tagline","site_description","hero_badge",
+        "stat1_val","stat1_label","stat2_val","stat2_label",
+        "stat3_val","stat3_label","stat4_val","stat4_label",
+        "price_normal","price_pro",
+        "chatbot_enabled","chatbot_name","chatbot_avatar","chatbot_welcome",
+        "reviews_enabled","faq_enabled",
+        "announcement_bar","announcement_text","announcement_color",
+        "maintenance_site_msg",
+    ]
+    for key in all_keys:
+        val = request.form.get(key)
+        if val is not None:
+            set_site_setting(key, val)
+    # Update SHOP_PRICES too if prices changed
+    try:
+        pn = request.form.get("price_normal")
+        pp = request.form.get("price_pro")
+        if pn: SHOP_PRICES["NORMAL"]["price"] = float(pn)
+        if pp: SHOP_PRICES["PRO"]["price"] = float(pp)
+    except: pass
+    add_log("OK","ADMIN","Site settings mis à jour", session["admin_user"])
+    tab = request.form.get("_tab","content")
+    return redirect(f"/admin/site?tab={tab}")
+
+@app.route("/admin/site/order/<order_id>/complete", methods=["POST"])
+@admin_required
+def admin_order_complete(order_id):
+    conn = get_db()
+    conn.execute("UPDATE shop_orders SET status='completed' WHERE order_id=?", (order_id,))
+    conn.commit(); conn.close()
+    add_log("OK","SHOP",f"Commande {order_id} completed", session["admin_user"])
+    return redirect("/admin/site?tab=orders")
+
+@app.route("/admin/site/order/<order_id>/cancel", methods=["POST"])
+@admin_required
+def admin_order_cancel(order_id):
+    conn = get_db()
+    conn.execute("UPDATE shop_orders SET status='cancelled' WHERE order_id=?", (order_id,))
+    conn.commit(); conn.close()
+    add_log("WARN","SHOP",f"Commande {order_id} annulée", session["admin_user"])
+    return redirect("/admin/site?tab=orders")
+
+@app.route("/admin/site/promo/<int:pid>/toggle", methods=["POST"])
+@admin_required
+def admin_promo_toggle(pid):
+    conn = get_db()
+    conn.execute("UPDATE promo_codes SET active=1-active WHERE id=?", (pid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=promos")
+
+@app.route("/admin/site/promo/<int:pid>/delete", methods=["POST"])
+@admin_required
+def admin_promo_delete(pid):
+    conn = get_db()
+    conn.execute("DELETE FROM promo_codes WHERE id=?", (pid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=promos")
+
+@app.route("/admin/site/promo/create", methods=["POST"])
+@admin_required
+def admin_promo_create():
+    code     = (request.form.get("code","") or "").upper().strip()
+    reduction= int(request.form.get("reduction",10) or 10)
+    plan     = (request.form.get("plan","ALL") or "ALL").upper()
+    max_uses = int(request.form.get("max_uses",0) or 0)
+    if code:
+        try:
+            conn = get_db()
+            conn.execute("INSERT INTO promo_codes (code,reduction,plan,max_uses,created_by,created_at) VALUES (?,?,?,?,?,?)",
+                         (code, reduction, plan, max_uses, session["admin_user"], int(time.time())))
+            conn.commit(); conn.close()
+        except: pass
+    return redirect("/admin/site?tab=promos")
+
+# Product CRUD
+@app.route("/admin/site/product/create", methods=["POST"])
+@admin_required
+def admin_product_create():
+    conn = get_db()
+    conn.execute("INSERT INTO site_products (plan,name,price,description,features,badge,active,sort_order) VALUES (?,?,?,?,?,?,?,?)",
+        (request.form.get("plan","NORMAL"), request.form.get("name",""),
+         float(request.form.get("price",4.99) or 4.99),
+         request.form.get("description",""), request.form.get("features","").replace("\n","|"),
+         request.form.get("badge",""), int(request.form.get("active",1) or 1),
+         int(request.form.get("sort_order",1) or 1)))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=products")
+
+@app.route("/admin/site/product/<int:pid>/edit", methods=["POST"])
+@admin_required
+def admin_product_edit(pid):
+    conn = get_db()
+    conn.execute("UPDATE site_products SET name=?,price=?,description=?,features=?,badge=?,active=? WHERE id=?",
+        (request.form.get("name",""),
+         float(request.form.get("price",4.99) or 4.99),
+         request.form.get("description",""),
+         request.form.get("features","").replace("\n","|"),
+         request.form.get("badge",""),
+         int(request.form.get("active",1) or 1),
+         pid))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=products")
+
+@app.route("/admin/site/product/<int:pid>/toggle", methods=["POST"])
+@admin_required
+def admin_product_toggle(pid):
+    conn = get_db()
+    conn.execute("UPDATE site_products SET active=1-active WHERE id=?", (pid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=products")
+
+# FAQ CRUD
+@app.route("/admin/site/faq/create", methods=["POST"])
+@admin_required
+def admin_faq_create():
+    conn = get_db()
+    conn.execute("INSERT INTO site_faq (question,answer,category,sort_order,active) VALUES (?,?,?,?,1)",
+        (request.form.get("question",""), request.form.get("answer",""),
+         request.form.get("category","general"), int(request.form.get("sort_order",1) or 1)))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=faq")
+
+@app.route("/admin/site/faq/<int:fid>/toggle", methods=["POST"])
+@admin_required
+def admin_faq_toggle(fid):
+    conn = get_db()
+    conn.execute("UPDATE site_faq SET active=1-active WHERE id=?", (fid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=faq")
+
+@app.route("/admin/site/faq/<int:fid>/delete", methods=["POST"])
+@admin_required
+def admin_faq_delete(fid):
+    conn = get_db()
+    conn.execute("DELETE FROM site_faq WHERE id=?", (fid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=faq")
+
+# Reviews CRUD
+@app.route("/admin/site/review/create", methods=["POST"])
+@admin_required
+def admin_review_create():
+    conn = get_db()
+    conn.execute("INSERT INTO site_testimonials (author,content,rating,game,avatar,active,created_at) VALUES (?,?,?,?,?,1,?)",
+        (request.form.get("author",""), request.form.get("content",""),
+         int(request.form.get("rating",5) or 5),
+         request.form.get("game",""), request.form.get("avatar","🎮"), int(time.time())))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=reviews")
+
+@app.route("/admin/site/review/<int:rid>/toggle", methods=["POST"])
+@admin_required
+def admin_review_toggle(rid):
+    conn = get_db()
+    conn.execute("UPDATE site_testimonials SET active=1-active WHERE id=?", (rid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=reviews")
+
+@app.route("/admin/site/review/<int:rid>/delete", methods=["POST"])
+@admin_required
+def admin_review_delete(rid):
+    conn = get_db()
+    conn.execute("DELETE FROM site_testimonials WHERE id=?", (rid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=reviews")
+
+# Chatbot CRUD
+@app.route("/admin/site/chatbot/create", methods=["POST"])
+@admin_required
+def admin_chatbot_create():
+    conn = get_db()
+    conn.execute("INSERT INTO chatbot_qa (keywords,response,category,active,hits) VALUES (?,?,?,1,0)",
+        (request.form.get("keywords","").lower(), request.form.get("response",""),
+         request.form.get("category","general")))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=chatbot")
+
+@app.route("/admin/site/chatbot/<int:qid>/toggle", methods=["POST"])
+@admin_required
+def admin_chatbot_toggle(qid):
+    conn = get_db()
+    conn.execute("UPDATE chatbot_qa SET active=1-active WHERE id=?", (qid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=chatbot")
+
+@app.route("/admin/site/chatbot/<int:qid>/delete", methods=["POST"])
+@admin_required
+def admin_chatbot_delete(qid):
+    conn = get_db()
+    conn.execute("DELETE FROM chatbot_qa WHERE id=?", (qid,))
+    conn.commit(); conn.close()
+    return redirect("/admin/site?tab=chatbot")
+
+# ── Client management from admin/site/clients tab ────────────────────────────
+@app.route("/admin/site/client/<username>/reset_password", methods=["POST"])
+@admin_required
+def admin_client_reset_password(username):
+    temp = _gen_temp_password()
+    conn = get_db()
+    conn.execute("UPDATE users SET must_change_pass=1,temp_password=? WHERE username=?", (temp, username))
+    conn.commit(); conn.close()
+    add_log("OK","ADMIN",f"Mdp reset pour {username}: {temp}", session["admin_user"])
+    return redirect("/admin/site?tab=clients")
+
+@app.route("/admin/site/client/<username>/reset_hwid", methods=["POST"])
+@admin_required
+def admin_client_reset_hwid(username):
+    conn = get_db()
+    conn.execute("UPDATE users SET hwid=NULL WHERE username=?", (username,))
+    conn.commit(); conn.close()
+    add_log("OK","ADMIN",f"HWID reset: {username}", session["admin_user"])
+    return redirect("/admin/site?tab=clients")
+
+@app.route("/admin/site/client/<username>/ban", methods=["POST"])
+@admin_required
+def admin_client_ban(username):
+    conn = get_db()
+    conn.execute("UPDATE users SET status='banned' WHERE username=?", (username,))
+    conn.commit(); conn.close()
+    add_log("WARN","ADMIN",f"Client banni: {username}", session["admin_user"])
+    return redirect("/admin/site?tab=clients")
+
+@app.route("/admin/site/client/<username>/unban", methods=["POST"])
+@admin_required
+def admin_client_unban(username):
+    conn = get_db()
+    conn.execute("UPDATE users SET status='active' WHERE username=?", (username,))
+    conn.commit(); conn.close()
+    add_log("OK","ADMIN",f"Client débanni: {username}", session["admin_user"])
+    return redirect("/admin/site?tab=clients")
+
+
+
+# ─── DÉMARRAGE ────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    init_db()
+    port = int(os.environ.get("PORT", 5000))
+
+    # Vérification d'intégrité : calcule le hash du fichier courant
+    # et le stocke au 1er run / compare aux suivants pour détecter
+    # toute modification non autorisée du code source
+    _INTEGRITY_FILE = ".srv_checksum"
+    try:
+        _src = open(__file__, "rb").read()
+        _current_hash = hashlib.sha256(_src).hexdigest()
+        if os.path.exists(_INTEGRITY_FILE):
+            _stored = open(_INTEGRITY_FILE).read().strip()
+            if _stored != _current_hash:
+                print(f"[⚠ INTEGRITY] Hash mismatch détecté ! Fichier modifié.")
+                print(f"  Stored : {_stored[:32]}…")
+                print(f"  Current: {_current_hash[:32]}…")
+                # En prod tu peux choisir d'abort ici : sys.exit(1)
+        else:
+            open(_INTEGRITY_FILE, "w").write(_current_hash)
+            print(f"[✅ INTEGRITY] Checksum enregistré: {_current_hash[:32]}…")
+    except Exception as _ie:
+        print(f"[INTEGRITY ERROR] {_ie}")
+
+    print("\n" + "="*54)
+    print(f"  ⚡ WINOPTIMIZER LICENSE SERVER v{APP_VERSION}")
+    print("="*54)
+    print(f"  Port     : {port}")
+    print(f"  Admin    : {DEFAULT_ADMIN['username']}")
+    print(f"  Panel    : http://localhost:{port}/admin")
+    print(f"  Remote   : http://localhost:{port}/admin/remote")
+    print(f"  DB       : {DB_PATH}")
+    print(f"  Security : Headers ✅ RateLimit ✅ Honeypot ✅ Integrity ✅")
+    print("="*54)
+    app.run(host="0.0.0.0", port=port, debug=False)
